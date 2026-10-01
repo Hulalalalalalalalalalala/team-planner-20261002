@@ -1,5 +1,5 @@
 from datetime import date
-from .storage import JsonStore, text, positive
+from .storage import JsonStore, text, positive, day
 
 class TeamPlanner(JsonStore):
     def add_member(self, member_id, name):
@@ -43,6 +43,44 @@ class TeamPlanner(JsonStore):
         if activity is None:
             raise ValueError("unknown activity")
         return {"activity_id": activity_id, "title": activity["title"], "on": activity["on"], "capacity": activity["capacity"], "members": [data["members"][member] for member in activity["participants"]]}
+
+    def record_completion(self, activity_id, member_id, completed_on):
+        activity_id = text(activity_id, "activity_id")
+        member_id = text(member_id, "member_id")
+        completed_on = day(completed_on, "completed_on")
+        data = self._read()
+        activity = data.get("activities", {}).get(activity_id)
+        if activity is None:
+            raise ValueError("unknown activity")
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        if member_id not in activity["participants"]:
+            raise ValueError("member is not enrolled in the activity")
+        done = data.setdefault("completions", {})
+        if member_id in done.get(activity_id, {}):
+            raise ValueError("completion already recorded")
+        if date.fromisoformat(completed_on) < date.fromisoformat(activity["on"]):
+            raise ValueError("completed_on must be on or after the activity date")
+        # Recording completion neither cancels enrollment nor frees capacity;
+        # the participant order in the activity is left untouched.
+        done.setdefault(activity_id, {})[member_id] = completed_on
+        self._write(data)
+        return {"activity_id": activity_id, "member_id": member_id, "completed_on": completed_on, "title": activity["title"], "on": activity["on"]}
+
+    def completions(self, member_id):
+        member_id = text(member_id, "member_id")
+        data = self._read()
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        records = []
+        for activity_id, members in data.get("completions", {}).items():
+            if member_id not in members:
+                continue
+            activity = data.get("activities", {}).get(activity_id)
+            if activity is None:
+                continue
+            records.append({"activity_id": activity_id, "member_id": member_id, "completed_on": members[member_id], "title": activity["title"], "on": activity["on"]})
+        return sorted(records, key=lambda r: (r["completed_on"], r["on"], r["activity_id"]))
 
     def activities(self):
         return sorted(self._read().get("activities", {}).values(), key=lambda a: (a["on"], a["activity_id"]))

@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import os
 import tempfile
+from datetime import date
 
 class JsonStore:
     def __init__(self, root):
@@ -37,3 +38,16 @@ def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
     return value
+
+def day(value, label):
+    # Only a real YYYY-MM-DD calendar date is accepted: no other types,
+    # no surrounding whitespace, no relaxed parsing.
+    if not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-":
+        raise ValueError(label + " must be a YYYY-MM-DD date string")
+    try:
+        parsed = date(int(value[0:4]), int(value[5:7]), int(value[8:10]))
+    except (ValueError, OverflowError):
+        raise ValueError(label + " must be a real YYYY-MM-DD date")
+    if parsed.isoformat() != value:
+        raise ValueError(label + " must be a real YYYY-MM-DD date")
+    return parsed.isoformat()
