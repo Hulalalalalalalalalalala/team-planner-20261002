@@ -31,6 +31,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `list` → `TeamPlanner.activities(...)`。参数名见 `core.py` 的公开方法签名。
 - `complete` → `TeamPlanner.record_completion(...)`。输入对象包含 `activity_id`、`member_id`、`completed_on`；完成日期须为真实存在的 `YYYY-MM-DD` 日期，且不早于活动日期。成功返回单条完成记录（含活动的 `title`、`on`）。
 - `completions` → `TeamPlanner.completions(...)`。输入对象包含 `member_id`；返回该成员的完成记录数组，按 `completed_on`、`on`、`activity_id` 升序排列，无记录时为空数组。
+- `merge` → `TeamPlanner.merge_member(...)`。输入对象包含 `source_member_id`（被合并成员）、`target_member_id`（保留成员）；两个标识去除首尾空白后均须为非空字符串且互不相同，两个成员均须存在。成功返回保留成员对象（保留其 `member_id` 和 `name`），并删除被合并成员档案。仅被合并成员报名的活动在原位置换成保留成员；两人都报名时只保留一个保留成员席位，位于两人在原名单中较早的位置，其余成员相对顺序不变，去重释放的名额可继续报名。完成记录归并到保留成员；同一活动仅一人有记录时直接归并，两人 `completed_on` 相同则合为一条，不同则拒绝整个合并且不留下部分结果。
 
 登记完成不取消报名、不释放名额，也不改变名单顺序；同一成员在同一活动只能登记一次。活动或成员不存在、成员未报名、重复登记或完成日期早于活动日期都会被拒绝。历史 `data.json` 没有完成记录字段时视为没有已完成培训。
 

@@ -107,5 +107,45 @@ class TeamPlanner(JsonStore):
             records.append({"activity_id": activity_id, "member_id": member_id, "completed_on": members[member_id], "title": activity["title"], "on": activity["on"]})
         return sorted(records, key=lambda r: (r["completed_on"], r["on"], r["activity_id"]))
 
+    def merge_member(self, source_member_id, target_member_id):
+        source_member_id = text(source_member_id, "source_member_id")
+        target_member_id = text(target_member_id, "target_member_id")
+        if source_member_id == target_member_id:
+            raise ValueError("source_member_id and target_member_id must differ")
+        data = self._read()
+        members = data.get("members", {})
+        if source_member_id not in members or target_member_id not in members:
+            raise ValueError("unknown member")
+        # Reject the whole merge before mutating anything if any activity has
+        # conflicting completion dates; no date is picked and no record is
+        # overwritten. Missing completions (legacy files) means no records.
+        for records in data.get("completions", {}).values():
+            if source_member_id in records and target_member_id in records:
+                if records[source_member_id] != records[target_member_id]:
+                    raise ValueError("completion records conflict")
+        # Merge enrollments: source alone is replaced in place; when both are
+        # enrolled, one target entry stays at the earlier position.
+        for activity in data.get("activities", {}).values():
+            participants = activity.get("participants", [])
+            if source_member_id not in participants:
+                continue
+            if target_member_id in participants:
+                keep = min(participants.index(source_member_id), participants.index(target_member_id))
+                participants[:] = [p for p in participants if p != source_member_id and p != target_member_id]
+                participants.insert(keep, target_member_id)
+            else:
+                participants[:] = [target_member_id if p == source_member_id else p for p in participants]
+        # Attribute all completion records to the retained member; equal dates
+        # collapse into the target's single existing record.
+        for records in data.get("completions", {}).values():
+            if source_member_id in records:
+                if target_member_id not in records:
+                    records[target_member_id] = records[source_member_id]
+                del records[source_member_id]
+        retained = members[target_member_id]
+        del members[source_member_id]
+        self._write(data)
+        return retained
+
     def activities(self):
         return sorted(self._read().get("activities", {}).values(), key=lambda a: (a["on"], a["activity_id"]))
