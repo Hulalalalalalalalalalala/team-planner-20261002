@@ -107,5 +107,49 @@ class TeamPlanner(JsonStore):
             records.append({"activity_id": activity_id, "member_id": member_id, "completed_on": members[member_id], "title": activity["title"], "on": activity["on"]})
         return sorted(records, key=lambda r: (r["completed_on"], r["on"], r["activity_id"]))
 
+    def merge_member(self, source_member_id, target_member_id):
+        source = text(source_member_id, "source_member_id")
+        target = text(target_member_id, "target_member_id")
+        if source == target:
+            raise ValueError("source and target must be different members")
+        data = self._read()
+        members = data.get("members", {})
+        if source not in members or target not in members:
+            raise ValueError("unknown member")
+        completions = data.get("completions", {})
+        # Validate every activity first: conflicting completion dates reject
+        # the whole merge before any participant list is touched.
+        for done in completions.values():
+            if source in done and target in done and done[source] != done[target]:
+                raise ValueError("completion dates differ for the two members")
+        for activity in data.get("activities", {}).values():
+            participants = activity.setdefault("participants", [])
+            if source not in participants:
+                continue
+            source_index = participants.index(source)
+            if target in participants:
+                target_index = participants.index(target)
+                # One retained seat at the earlier of the two positions;
+                # everyone else keeps their relative order.
+                keep_index, drop_index = (source_index, target_index) if source_index < target_index else (target_index, source_index)
+                participants[keep_index] = target
+                del participants[drop_index]
+            else:
+                participants[source_index] = target
+        for activity_id, done in completions.items():
+            if source not in done:
+                continue
+            merged = {}
+            for member_id, completed_on in done.items():
+                if member_id == source:
+                    if target not in done:
+                        merged[target] = completed_on
+                else:
+                    merged[member_id] = completed_on
+            completions[activity_id] = merged
+        del members[source]
+        self._write(data)
+        return members[target]
+
     def activities(self):
         return sorted(self._read().get("activities", {}).values(), key=lambda a: (a["on"], a["activity_id"]))
