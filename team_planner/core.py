@@ -37,6 +37,31 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return activity
 
+    def reschedule_activity(self, activity_id, on):
+        activity_id = text(activity_id, "activity_id")
+        on = day(on, "on")
+        data = self._read()
+        activity = data.get("activities", {}).get(activity_id)
+        if activity is None:
+            raise ValueError("unknown activity")
+        # Same date is always a no-op, even with completion records or a
+        # same-day conflict; nothing is rewritten.
+        if on == activity["on"]:
+            return activity
+        if data.get("completions", {}).get(activity_id):
+            raise ValueError("activity already has completion records")
+        participants = set(activity["participants"])
+        for other_id, other in data.get("activities", {}).items():
+            if other_id == activity_id or other.get("on") != on:
+                continue
+            # Completion keeps the enrollment, so participants lists already
+            # include members who finished the training.
+            if participants & set(other.get("participants", [])):
+                raise ValueError("participant is enrolled in another activity on that date")
+        activity["on"] = on
+        self._write(data)
+        return activity
+
     def roster(self, activity_id):
         data = self._read()
         activity = data.get("activities", {}).get(activity_id)

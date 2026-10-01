@@ -26,6 +26,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `member` → `TeamPlanner.add_member(...)`。参数名见 `core.py` 的公开方法签名。
 - `activity` → `TeamPlanner.create_activity(...)`。参数名见 `core.py` 的公开方法签名。
 - `enroll` → `TeamPlanner.enroll(...)`。参数名见 `core.py` 的公开方法签名。
+- `reschedule` → `TeamPlanner.reschedule_activity(...)`。输入对象包含 `activity_id`、`on`；新日期须为真实存在的 `YYYY-MM-DD` 字符串。成功返回完整活动对象（仅 `on` 改变，标题、容量、参与者及顺序不变）。新日期与原日期相同时直接返回原活动，不重写数据。活动已有任何完成记录，或某位当前参与者已报名新日期当天的另一活动时拒绝调整。
 - `roster` → `TeamPlanner.roster(...)`。参数名见 `core.py` 的公开方法签名。
 - `list` → `TeamPlanner.activities(...)`。参数名见 `core.py` 的公开方法签名。
 - `complete` → `TeamPlanner.record_completion(...)`。输入对象包含 `activity_id`、`member_id`、`completed_on`；完成日期须为真实存在的 `YYYY-MM-DD` 日期，且不早于活动日期。成功返回单条完成记录（含活动的 `title`、`on`）。
