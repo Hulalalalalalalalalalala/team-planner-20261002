@@ -29,6 +29,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `roster` → `TeamPlanner.roster(...)`。参数名见 `core.py` 的公开方法签名。
 - `list` → `TeamPlanner.activities(...)`。参数名见 `core.py` 的公开方法签名。
 - `complete` → `TeamPlanner.record_completion(...)`。输入对象包含 `activity_id`、`member_id`、`completed_on`；完成日期须为真实存在的 `YYYY-MM-DD` 日期，且不早于活动日期。成功返回单条完成记录（含活动的 `title`、`on`）。
+- `reschedule` → `TeamPlanner.reschedule_activity(...)`。输入对象包含 `activity_id`、`on`；新日期须为真实存在的 `YYYY-MM-DD` 日期。成功返回完整活动对象，字段与创建活动一致，仅 `on` 改变。新日期与原日期相同时直接返回原活动；日期确有变化时，活动已有任何完成记录、或某位当前参与者已报名新日期当天的另一活动，都会被拒绝。
 - `completions` → `TeamPlanner.completions(...)`。输入对象包含 `member_id`；返回该成员的完成记录数组，按 `completed_on`、`on`、`activity_id` 升序排列，无记录时为空数组。
 
 登记完成不取消报名、不释放名额，也不改变名单顺序；同一成员在同一活动只能登记一次。活动或成员不存在、成员未报名、重复登记或完成日期早于活动日期都会被拒绝。历史 `data.json` 没有完成记录字段时视为没有已完成培训。
