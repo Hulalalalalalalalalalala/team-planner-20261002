@@ -1,5 +1,5 @@
 from datetime import date
-from .storage import JsonStore, text, positive
+from .storage import JsonStore, text, positive, strict_date
 
 class TeamPlanner(JsonStore):
     def add_member(self, member_id, name):
@@ -46,3 +46,32 @@ class TeamPlanner(JsonStore):
 
     def activities(self):
         return sorted(self._read().get("activities", {}).values(), key=lambda a: (a["on"], a["activity_id"]))
+
+    def record_completion(self, activity_id, member_id, completed_on):
+        activity_id, member_id = text(activity_id, "activity_id"), text(member_id, "member_id")
+        completed_on = strict_date(completed_on, "completed_on")
+        data = self._read()
+        activity = data.get("activities", {}).get(activity_id)
+        if activity is None:
+            raise ValueError("unknown activity")
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        if member_id not in activity["participants"]:
+            raise ValueError("member is not enrolled in this activity")
+        completions = data.setdefault("completions", [])
+        if any(row["activity_id"] == activity_id and row["member_id"] == member_id for row in completions):
+            raise ValueError("completion already recorded")
+        if completed_on < activity["on"]:
+            raise ValueError("completed_on is earlier than the activity date")
+        record = {"activity_id": activity_id, "member_id": member_id, "completed_on": completed_on, "title": activity["title"], "on": activity["on"]}
+        completions.append(record)
+        self._write(data)
+        return record
+
+    def completions(self, member_id):
+        member_id = text(member_id, "member_id")
+        data = self._read()
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        records = [row for row in data.get("completions", []) if row["member_id"] == member_id]
+        return sorted(records, key=lambda row: (row["completed_on"], row["on"], row["activity_id"]))

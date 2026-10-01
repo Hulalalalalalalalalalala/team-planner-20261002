@@ -1,6 +1,8 @@
+from datetime import date
 from pathlib import Path
 import json
 import os
+import re
 import tempfile
 
 class JsonStore:
@@ -37,3 +39,11 @@ def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
     return value
+
+def strict_date(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError(label + " must be a YYYY-MM-DD date string")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ValueError(label + " must be a real date") from None
