@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import TeamPlanner
 
-ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'reschedule': 'reschedule_activity', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'completions': 'completions', 'merge': 'merge_member'}
+ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'transfer': 'transfer_enrollment', 'reschedule': 'reschedule_activity', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'completions': 'completions', 'merge': 'merge_member'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

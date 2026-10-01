@@ -26,6 +26,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `member` → `TeamPlanner.add_member(...)`。参数名见 `core.py` 的公开方法签名。
 - `activity` → `TeamPlanner.create_activity(...)`。参数名见 `core.py` 的公开方法签名。
 - `enroll` → `TeamPlanner.enroll(...)`。参数名见 `core.py` 的公开方法签名。
+- `transfer` → `TeamPlanner.transfer_enrollment(...)`。输入对象包含 `source_activity_id`、`target_activity_id`、`member_id`；三个标识去除首尾空白后须非空。把成员从原活动转到目标活动：原活动删除该成员并释放一个名额，目标活动将其追加到参与者末尾并占用一个名额，其他参与者相对顺序不变，成员档案与两项活动的标题、日期、容量不变。成功返回目标活动的完整对象。原活动、目标活动或成员不存在、两项活动相同、成员未报名原活动或已报名目标活动、目标活动已满都会被拒绝；成员在原活动已有完成记录时同样拒绝（其他成员的完成记录不影响，任何完成记录都不会被删除或迁移）。成员在目标日期已报名第三个活动（不含原活动与目标活动，已完成培训的报名也算）时拒绝。任何拒绝都不改动数据，也不创建数据文件。
 - `reschedule` → `TeamPlanner.reschedule_activity(...)`。输入对象包含 `activity_id`、`on`；新日期须为真实存在的 `YYYY-MM-DD` 字符串。成功返回完整活动对象（仅 `on` 改变，标题、容量、参与者及顺序不变）。新日期与原日期相同时直接返回原活动，不重写数据。活动已有任何完成记录，或某位当前参与者已报名新日期当天的另一活动时拒绝调整。
 - `roster` → `TeamPlanner.roster(...)`。参数名见 `core.py` 的公开方法签名。
 - `list` → `TeamPlanner.activities(...)`。参数名见 `core.py` 的公开方法签名。
