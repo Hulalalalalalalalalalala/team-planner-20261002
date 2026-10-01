@@ -188,3 +188,48 @@ class TeamPlanner(JsonStore):
 
     def activities(self):
         return sorted(self._read().get("activities", {}).values(), key=lambda a: (a["on"], a["activity_id"]))
+
+    def member_schedule(self, member_id, from_on=None, to_on=None, status="all"):
+        member_id = text(member_id, "member_id")
+        if from_on is not None:
+            from_on = day(from_on, "from_on")
+        if to_on is not None:
+            to_on = day(to_on, "to_on")
+        if from_on is not None and to_on is not None and from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        if status not in ("all", "pending", "completed"):
+            raise ValueError("status must be one of all, pending, completed")
+        data = self._read()
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Conflicts come from the member's full current schedule, ignoring the
+        # date range and status filters, so a completed or filtered-out
+        # enrollment still shows up as a same-day conflict.
+        enrolled_on = {}
+        for activity_id, activity in activities.items():
+            if member_id in activity.get("participants", []):
+                enrolled_on.setdefault(activity.get("on"), set()).add(activity_id)
+        records = []
+        for activity_id, activity in activities.items():
+            if member_id not in activity.get("participants", []):
+                continue
+            on = activity["on"]
+            if from_on is not None and on < from_on:
+                continue
+            if to_on is not None and on > to_on:
+                continue
+            completed_on = completions.get(activity_id, {}).get(member_id)
+            current = "completed" if completed_on is not None else "pending"
+            if status != "all" and current != status:
+                continue
+            records.append({
+                "activity_id": activity_id,
+                "title": activity["title"],
+                "on": on,
+                "status": current,
+                "completed_on": completed_on,
+                "conflict_activity_ids": sorted(aid for aid in enrolled_on.get(on, ()) if aid != activity_id),
+            })
+        return sorted(records, key=lambda r: (r["on"], r["activity_id"]))

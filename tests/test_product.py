@@ -273,5 +273,154 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], ["M-004"])
         self.assertEqual(TeamPlanner(self.root).roster("A-002")["members"][-1], {"member_id": "M-002", "name": "小林"})
 
+    def _schedule_ready(self):
+        # 小陈 is enrolled in A-001/A-002 on the 15th and A-003 on the 20th;
+        # 小林 shares A-001 and alone occupies A-005 on the 20th.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-001", "十五号培训一", "2026-10-15", 4)
+        self.app.create_activity("A-002", "十五号培训二", "2026-10-15", 4)
+        self.app.create_activity("A-003", "二十号培训", "2026-10-20", 4)
+        self.app.create_activity("A-005", "二十号他人培训", "2026-10-20", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-003", "M-001")
+        self.app.enroll("A-001", "M-002")
+        self.app.enroll("A-005", "M-002")
+        self.app.record_completion("A-001", "M-001", "2026-10-16")
+
+    def test_member_schedule_entries_sorted_with_status(self):
+        self._schedule_ready()
+        rows = self.app.member_schedule("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-001", "A-002", "A-003"])
+        self.assertEqual(rows[0], {"activity_id": "A-001", "title": "十五号培训一", "on": "2026-10-15", "status": "completed", "completed_on": "2026-10-16", "conflict_activity_ids": ["A-002"]})
+        self.assertEqual(rows[1], {"activity_id": "A-002", "title": "十五号培训二", "on": "2026-10-15", "status": "pending", "completed_on": None, "conflict_activity_ids": ["A-001"]})
+        # A-005 runs on the same day but 小陈 never enrolled, so it is no conflict.
+        self.assertEqual(rows[2], {"activity_id": "A-003", "title": "二十号培训", "on": "2026-10-20", "status": "pending", "completed_on": None, "conflict_activity_ids": []})
+        # A member with no enrollments gets an empty schedule, and trimming applies.
+        self.app.add_member("M-003", "小周")
+        self.assertEqual(self.app.member_schedule("  M-003 "), [])
+
+    def test_member_schedule_conflicts_ignore_status_filter(self):
+        self._schedule_ready()
+        pending = self.app.member_schedule("M-001", status="pending")
+        self.assertEqual([r["activity_id"] for r in pending], ["A-002", "A-003"])
+        # The completed A-001 is hidden by the filter but still conflicts with A-002.
+        self.assertEqual(pending[0]["conflict_activity_ids"], ["A-001"])
+        completed = self.app.member_schedule("M-001", status="completed")
+        self.assertEqual([r["activity_id"] for r in completed], ["A-001"])
+        # The pending A-002 is hidden by the filter but still conflicts with A-001.
+        self.assertEqual(completed[0]["conflict_activity_ids"], ["A-002"])
+
+    def test_member_schedule_date_range_inclusive(self):
+        self._schedule_ready()
+        self.assertEqual([r["activity_id"] for r in self.app.member_schedule("M-001", from_on="2026-10-20")], ["A-003"])
+        self.assertEqual([r["activity_id"] for r in self.app.member_schedule("M-001", to_on="2026-10-15")], ["A-001", "A-002"])
+        self.assertEqual([r["activity_id"] for r in self.app.member_schedule("M-001", from_on="2026-10-15", to_on="2026-10-15")], ["A-001", "A-002"])
+        self.assertEqual([r["activity_id"] for r in self.app.member_schedule("M-001", from_on=None, to_on=None)], ["A-001", "A-002", "A-003"])
+        self.assertEqual(self.app.member_schedule("M-001", from_on="2026-10-21"), [])
+
+    def test_member_schedule_conflict_ids_sorted_with_three_same_day(self):
+        self.app.add_member("M-001", "小陈")
+        for activity_id, title in [("A-003", "三"), ("A-001", "一"), ("A-002", "二")]:
+            self.app.create_activity(activity_id, title, "2026-11-01", 4)
+            self.app.enroll(activity_id, "M-001")
+        rows = self.app.member_schedule("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-001", "A-002", "A-003"])
+        self.assertEqual(rows[0]["conflict_activity_ids"], ["A-002", "A-003"])
+        self.assertEqual(rows[1]["conflict_activity_ids"], ["A-001", "A-003"])
+        self.assertEqual(rows[2]["conflict_activity_ids"], ["A-001", "A-002"])
+
+    def test_member_schedule_rejections_never_modify_state(self):
+        self._schedule_ready()
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            {"member_id": "GHOST"},
+            {"member_id": 9},
+            {"member_id": None},
+            {"member_id": "   "},
+            {"member_id": "M-001", "from_on": 10},
+            {"member_id": "M-001", "to_on": "2026-02-30"},
+            {"member_id": "M-001", "from_on": " 2026-10-15"},
+            {"member_id": "M-001", "from_on": "2026/10/15"},
+            {"member_id": "M-001", "from_on": "2026-13-01"},
+            {"member_id": "M-001", "from_on": "2026-10-20", "to_on": "2026-10-15"},
+            {"member_id": "M-001", "status": "done"},
+            {"member_id": "M-001", "status": None},
+            {"member_id": "M-001", "status": "PENDING"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.member_schedule(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # A successful query does not rewrite the file either.
+        self.app.member_schedule("M-001", from_on="2026-10-01", to_on="2026-12-31", status="all")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_member_schedule_unknown_member_does_not_create_empty_dir(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.member_schedule("GHOST")
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_member_schedule_legacy_file_without_completions_is_pending(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        row = TeamPlanner(legacy).member_schedule("M-001")[0]
+        self.assertEqual(row["status"], "pending")
+        self.assertIsNone(row["completed_on"])
+
+    def test_member_schedule_reflects_transfer_reschedule_and_merge(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-001", "一号", "2026-11-01", 4)
+        self.app.create_activity("A-002", "二号", "2026-11-02", 4)
+        self.app.create_activity("A-003", "三号", "2026-11-03", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-003", "M-002")
+        # A transfer moves the seat to the new date.
+        self.app.transfer_enrollment("A-001", "A-002", "M-001")
+        self.assertEqual([r["activity_id"] for r in self.app.member_schedule("M-001")], ["A-002"])
+        # A reschedule moves the date as well.
+        self.app.reschedule_activity("A-002", "2026-11-05")
+        self.assertEqual(self.app.member_schedule("M-001")[0]["on"], "2026-11-05")
+        # After a merge the target keeps both seats (ordered by date) and the
+        # deleted member is unknown.
+        self.app.merge_member("M-002", "M-001")
+        self.assertEqual([r["activity_id"] for r in self.app.member_schedule("M-001")], ["A-003", "A-002"])
+        with self.assertRaises(ValueError):
+            self.app.member_schedule("M-002")
+
+    def test_cli_schedule_object_array_and_failure(self):
+        self._schedule_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "schedule", name], text=True, capture_output=True)
+        ok = run({"member_id": "M-001", "status": "pending"})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([r["activity_id"] for r in json.loads(ok.stdout)], ["A-002", "A-003"])
+        self.app.add_member("M-003", "小周")
+        batch = run([{"member_id": "M-001"}, {"member_id": "M-003"}])
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["activity_id"] for r in values[0]], ["A-001", "A-002", "A-003"])
+        self.assertEqual(values[1], [])
+        bad = run({"member_id": "GHOST"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        # A failing array produces no partial output on stdout.
+        partial = run([{"member_id": "M-001"}, {"member_id": "GHOST"}])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+
 if __name__ == "__main__":
     unittest.main()
