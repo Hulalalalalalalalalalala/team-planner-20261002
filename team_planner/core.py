@@ -37,6 +37,41 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return activity
 
+    def transfer_enrollment(self, source_activity_id, target_activity_id, member_id):
+        source_activity_id = text(source_activity_id, "source_activity_id")
+        target_activity_id = text(target_activity_id, "target_activity_id")
+        member_id = text(member_id, "member_id")
+        data = self._read()
+        activities = data.get("activities", {})
+        source = activities.get(source_activity_id)
+        target = activities.get(target_activity_id)
+        if source is None or target is None or member_id not in data.get("members", {}):
+            raise ValueError("unknown activity or member")
+        if source_activity_id == target_activity_id:
+            raise ValueError("source and target activities must differ")
+        if member_id not in source["participants"]:
+            raise ValueError("member is not enrolled in the source activity")
+        if member_id in target["participants"]:
+            raise ValueError("member is already enrolled in the target activity")
+        if len(target["participants"]) >= target["capacity"]:
+            raise ValueError("target activity is full")
+        # A finished training can neither be moved nor have its completion
+        # record left behind; other members' records do not block the transfer.
+        if member_id in data.get("completions", {}).get(source_activity_id, {}):
+            raise ValueError("member has a completion record for the source activity")
+        # The member must not keep a seat in a third activity on the target
+        # date. Completion does not cancel enrollment, so participants lists
+        # already cover finished trainings; source and target are excluded.
+        for other_id, other in activities.items():
+            if other_id in (source_activity_id, target_activity_id):
+                continue
+            if other.get("on") == target["on"] and member_id in other.get("participants", []):
+                raise ValueError("member is enrolled in another activity on the target date")
+        source["participants"].remove(member_id)
+        target["participants"].append(member_id)
+        self._write(data)
+        return target
+
     def reschedule_activity(self, activity_id, on):
         activity_id = text(activity_id, "activity_id")
         on = day(on, "on")
