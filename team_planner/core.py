@@ -40,6 +40,75 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return activity
 
+    def enroll_batch(self, records):
+        # The whole group takes effect at once: every entry is normalized and
+        # checked before any participant list is touched.
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "member_id"}:
+                raise ValueError("each record must contain only activity_id and member_id")
+            activity_id = text(item["activity_id"], "activity_id")
+            member_id = text(item["member_id"], "member_id")
+            # A repeated activity/member pair rejects the whole group; the same
+            # member joining one activity twice is never merged. Cross-activity
+            # and cross-member entries are allowed.
+            pair = (activity_id, member_id)
+            if pair in seen:
+                raise ValueError("records must not contain duplicate activity and member pairs")
+            seen.add(pair)
+            entries.append((activity_id, member_id))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        # Validate every entry first: the activity and member must exist and
+        # the member must not already hold a seat. Completed trainings keep
+        # their seats, so the participants lists already cover them.
+        for activity_id, member_id in entries:
+            activity = activities.get(activity_id)
+            if activity is None or member_id not in members:
+                raise ValueError("unknown activity or member")
+            if member_id in activity.get("participants", []):
+                raise ValueError("member already enrolled")
+        # Capacity is judged on the final rosters after the whole group joins:
+        # an activity with one seat left rejects two members joining together.
+        added = {}
+        for activity_id, _ in entries:
+            added[activity_id] = added.get(activity_id, 0) + 1
+        for activity_id, count in added.items():
+            activity = activities[activity_id]
+            if len(activity.get("participants", [])) + count > activity["capacity"]:
+                raise ValueError("activity is full")
+        # Same-day conflicts cover both enrollments already stored and seats
+        # added by this batch: a member's two new entries on one date conflict
+        # even though neither is stored yet, and a completed enrollment still
+        # counts. Other members' enrollments and historical conflicts on dates
+        # this batch does not touch never block the group.
+        existing_on = {}
+        for other_id, other in activities.items():
+            for participant in other.get("participants", []):
+                existing_on.setdefault(participant, {}).setdefault(other.get("on"), set()).add(other_id)
+        batch_on = {}
+        for activity_id, member_id in entries:
+            batch_on.setdefault(member_id, {}).setdefault(activities[activity_id]["on"], set()).add(activity_id)
+        for activity_id, member_id in entries:
+            on = activities[activity_id]["on"]
+            same_day = set(existing_on.get(member_id, {}).get(on, ()))
+            same_day |= batch_on.get(member_id, {}).get(on, set())
+            same_day.discard(activity_id)
+            if same_day:
+                raise ValueError("member is enrolled in another activity on the same date")
+        # Existing participants keep their relative order; new members are
+        # appended to their activities in input order.
+        for activity_id, member_id in entries:
+            activities[activity_id]["participants"].append(member_id)
+        self._write(data)
+        # One full activity object per entry, in input order; an activity named
+        # by several entries reflects the final roster after the whole group.
+        return [activities[activity_id] for activity_id, _ in entries]
+
     def transfer_enrollment(self, source_activity_id, target_activity_id, member_id):
         source_activity_id = text(source_activity_id, "source_activity_id")
         target_activity_id = text(target_activity_id, "target_activity_id")
