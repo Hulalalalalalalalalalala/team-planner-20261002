@@ -777,5 +777,156 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(TeamPlanner(self.root).roster("A-001")["on"], "2026-10-17")
         self.assertEqual(TeamPlanner(self.root).roster("A-002")["on"], "2026-10-15")
 
+    def _put_doc(self, doc=None, raw=None):
+        path = self.root / "data.json"
+        if raw is not None:
+            path.write_bytes(raw)
+        else:
+            path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def _base_doc(self):
+        return {
+            "members": {
+                "M-001": {"member_id": "M-001", "name": "小陈"},
+                "M-002": {"member_id": "M-002", "name": "小林"},
+            },
+            "activities": {"A-001": {"activity_id": "A-001", "title": "培训", "on": "2026-10-15", "capacity": 2, "participants": ["M-001"]}},
+            "completions": {},
+            "version": 3,
+        }
+
+    def test_legacy_document_with_extra_fields_and_same_day_enrollments(self):
+        # Fictional 2026-10-15 history: extra fields on every level, one member
+        # enrolled in two activities that day, one completed enrollment still
+        # occupying a seat, and no completions field at all for another root.
+        doc = {
+            "schema": 1,
+            "members": {
+                "M-001": {"member_id": "M-001", "name": "小陈", "phone": "ext-1"},
+                "M-002": {"member_id": "M-002", "name": "小林"},
+            },
+            "activities": {
+                "A-001": {"activity_id": "A-001", "title": "培训一", "on": "2026-10-15", "capacity": 2, "participants": ["M-001"], "room": "R1"},
+                "A-002": {"activity_id": "A-002", "title": "培训二", "on": "2026-10-15", "capacity": 2, "participants": ["M-001", "M-002"]},
+            },
+            "completions": {"A-002": {"M-001": "2026-10-15"}},
+        }
+        self._put_doc(doc)
+        app = TeamPlanner(self.root)
+        rows = app.member_schedule("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-001", "A-002"])
+        self.assertEqual(rows[0]["conflict_activity_ids"], ["A-002"])
+        self.assertEqual(rows[1]["status"], "completed")
+        self.assertEqual(app.activities()[0]["room"], "R1")
+        # A successful modification keeps every extra field and the completed
+        # enrollment's seat; the old file is not repaired or normalized.
+        TeamPlanner(self.root).record_completion("A-001", "M-001", "2026-10-16")
+        saved = json.loads((self.root / "data.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["schema"], 1)
+        self.assertEqual(saved["members"]["M-001"]["phone"], "ext-1")
+        self.assertEqual(saved["activities"]["A-001"]["room"], "R1")
+        self.assertEqual(saved["activities"]["A-002"]["participants"], ["M-001", "M-002"])
+        # A root without the completions field means no completion records.
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({
+            "members": {"M-001": {"member_id": "M-001", "name": "小陈"}},
+            "activities": {"A-001": {"activity_id": "A-001", "title": "t", "on": "2026-10-15", "capacity": 1, "participants": ["M-001"]}},
+        }), encoding="utf-8")
+        self.assertEqual(TeamPlanner(legacy).completions("M-001"), [])
+
+    def test_invalid_historical_documents_are_rejected_and_left_untouched(self):
+        def over_capacity(d):
+            d["activities"]["A-001"]["capacity"] = 1
+            d["activities"]["A-001"]["participants"] = ["M-001", "M-002"]
+        transforms = [
+            lambda d: d.update(members=None),
+            lambda d: d.update(members=[]),
+            lambda d: d.update(activities="x"),
+            lambda d: d.update(completions=5),
+            lambda d: d["members"].__setitem__("M-003", []),
+            lambda d: d["members"].__setitem__("M-003", {"member_id": "OTHER", "name": "n"}),
+            lambda d: d["members"].__setitem__("M-003", {"member_id": "M-003", "name": "  "}),
+            lambda d: d["members"].__setitem__("M-003", {"member_id": "M-003"}),
+            lambda d: d.update(members={" M-001": {"member_id": " M-001", "name": "x"}}),
+            lambda d: d.update(members={"": {"member_id": "", "name": "x"}}),
+            lambda d: d["activities"].__setitem__("A-002", []),
+            lambda d: d["activities"]["A-001"].__setitem__("activity_id", "OTHER"),
+            lambda d: d["activities"]["A-001"].__setitem__("title", " "),
+            lambda d: d["activities"]["A-001"].__setitem__("on", "2026-02-30"),
+            lambda d: d["activities"]["A-001"].__setitem__("capacity", True),
+            lambda d: d["activities"]["A-001"].__setitem__("capacity", 0),
+            lambda d: d["activities"]["A-001"].__setitem__("capacity", "2"),
+            lambda d: d["activities"]["A-001"].__setitem__("participants", {}),
+            lambda d: d["activities"]["A-001"].__setitem__("participants", ["M-001", "M-001"]),
+            lambda d: d["activities"]["A-001"].__setitem__("participants", ["GHOST"]),
+            lambda d: d["activities"]["A-001"].__setitem__("participants", [" M-001"]),
+            over_capacity,
+            lambda d: d["completions"].__setitem__("GHOST", {}),
+            lambda d: d["completions"].__setitem__("A-001", []),
+            lambda d: d["completions"].__setitem__("A-001", {"GHOST": "2026-10-15"}),
+            lambda d: d["completions"].__setitem__("A-001", {"M-001": "2026-10-14"}),
+            lambda d: d["completions"].__setitem__("A-001", {"M-001": "2026-10-15x"}),
+        ]
+        for transform in transforms:
+            doc = self._base_doc()
+            transform(doc)
+            path = self._put_doc(doc)
+            before = path.read_bytes()
+            # Queries and writes are both refused; no partial result is returned
+            # and the existing file bytes never change.
+            with self.assertRaises(ValueError):
+                TeamPlanner(self.root).activities()
+            with self.assertRaises(ValueError):
+                TeamPlanner(self.root).add_member("M-009", "新人")
+            self.assertEqual(path.read_bytes(), before)
+        # An empty inner completions object is valid history.
+        doc = self._base_doc()
+        doc["completions"] = {"A-001": {}}
+        self._put_doc(doc)
+        self.assertEqual(TeamPlanner(self.root).completions("M-001"), [])
+
+    def test_raw_file_and_cross_record_validation(self):
+        for raw in [b"{not json", b'{"members": "\xff"}', b"[]", b"null", b"42"]:
+            path = self._put_doc(raw=raw)
+            with self.assertRaises(ValueError):
+                TeamPlanner(self.root).activities()
+            self.assertEqual(path.read_bytes(), raw)
+        # The whole document is validated: filtering a query must not hide an
+        # unrelated invalid activity (here: an unknown participant elsewhere).
+        self._put_doc({
+            "members": {"M-001": {"member_id": "M-001", "name": "小陈"}},
+            "activities": {
+                "A-OK": {"activity_id": "A-OK", "title": "t", "on": "2026-10-15", "capacity": 1, "participants": []},
+                "A-BAD": {"activity_id": "A-BAD", "title": "t", "on": "2026-10-15", "capacity": 1, "participants": ["GHOST"]},
+            },
+        })
+        with self.assertRaises(ValueError):
+            TeamPlanner(self.root).roster("A-OK")
+        with self.assertRaises(ValueError):
+            TeamPlanner(self.root).member_schedule("M-001")
+        # A missing file stays empty data and creates neither file nor directory.
+        missing = self.root / "missing"
+        self.assertEqual(TeamPlanner(missing).activities(), [])
+        self.assertFalse(missing.exists())
+        # Operating-system read errors still surface as OSError.
+        target = self.root / "dir"
+        target.mkdir()
+        (target / "data.json").mkdir()
+        with self.assertRaises(OSError):
+            TeamPlanner(target).activities()
+
+    def test_cli_rejects_invalid_history_with_empty_stdout(self):
+        self._put_doc({
+            "members": {"M-001": {"member_id": "M-001", "name": "小陈"}},
+            "activities": {"A-001": {"activity_id": "A-001", "title": "t", "on": "2026-10-15",
+                                     "capacity": 1, "participants": ["GHOST"]}},
+        })
+        result = subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "list"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("error", json.loads(result.stderr))
+
 if __name__ == "__main__":
     unittest.main()
