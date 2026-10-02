@@ -383,6 +383,58 @@ class TeamPlanner(JsonStore):
             })
         return sorted(records, key=lambda r: (r["on"], r["activity_id"]))
 
+    def enrollment_options(self, member_id, from_on=None, to_on=None, available_only=False):
+        member_id = text(member_id, "member_id")
+        if from_on is not None:
+            from_on = day(from_on, "from_on")
+        if to_on is not None:
+            to_on = day(to_on, "to_on")
+        if from_on is not None and to_on is not None and from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        if type(available_only) is not bool:
+            raise ValueError("available_only must be a boolean")
+        data = self._read()
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        activities = data.get("activities", {})
+        # Exactly like member_schedule, conflicts come from the member's full
+        # current enrollment: a finished training keeps its seat, so completed
+        # enrollments still conflict; other members' enrollments never do.
+        enrolled_on = {}
+        for activity_id, activity in activities.items():
+            if member_id in activity.get("participants", []):
+                enrolled_on.setdefault(activity.get("on"), set()).add(activity_id)
+        options = []
+        for activity_id, activity in activities.items():
+            # Every current enrollment is excluded from the candidates,
+            # including finished trainings that still occupy the seat.
+            if member_id in activity.get("participants", []):
+                continue
+            on = activity["on"]
+            if from_on is not None and on < from_on:
+                continue
+            if to_on is not None and on > to_on:
+                continue
+            remaining_seats = activity["capacity"] - len(activity.get("participants", []))
+            # The member is not enrolled in this candidate, so every same-day
+            # enrollment is an "other" activity.
+            conflict_activity_ids = sorted(enrolled_on.get(on, ()))
+            available = remaining_seats > 0 and not conflict_activity_ids
+            # When filtered to available candidates a full or conflicting
+            # option is dropped; otherwise both facts stay visible together.
+            if available_only and not available:
+                continue
+            options.append({
+                "activity_id": activity_id,
+                "title": activity["title"],
+                "on": on,
+                "capacity": activity["capacity"],
+                "remaining_seats": remaining_seats,
+                "available": available,
+                "conflict_activity_ids": conflict_activity_ids,
+            })
+        return sorted(options, key=lambda r: (r["on"], r["activity_id"]))
+
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
             from_on = day(from_on, "from_on")

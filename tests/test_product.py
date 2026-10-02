@@ -1092,5 +1092,231 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(partial.stderr))
         self.assertEqual(partial.stdout, "")
 
+    def _options_ready(self):
+        # On 2026-10-15 小陈 is enrolled in A-001 (already completed) and in no
+        # other activity; 小林 occupies A-003 alone. A-002 is full with 小林 and
+        # 小周. On the 20th A-004 is full (小周) and A-005 still has free seats.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训一", "2026-10-15", 2)
+        self.app.create_activity("A-002", "十五号培训二", "2026-10-15", 2)
+        self.app.create_activity("A-003", "十五号培训三", "2026-10-15", 3)
+        self.app.create_activity("A-004", "二十已满员", "2026-10-20", 1)
+        self.app.create_activity("A-005", "二十有余位", "2026-10-20", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-003")
+        self.app.enroll("A-002", "M-002")
+        self.app.enroll("A-003", "M-002")
+        self.app.enroll("A-004", "M-003")
+        self.app.enroll("A-005", "M-002")
+        self.app.record_completion("A-001", "M-001", "2026-10-16")
+
+    def test_enrollment_options_exclude_enrolled_and_keep_full_and_conflict(self):
+        self._options_ready()
+        rows = self.app.enrollment_options("M-001")
+        # A-001 is excluded: 小陈 is enrolled there even though it is finished.
+        self.assertEqual([r["activity_id"] for r in rows], ["A-002", "A-003", "A-004", "A-005"])
+        # A-002 is full AND conflicts with the completed A-001: both facts stay.
+        self.assertEqual(rows[0], {
+            "activity_id": "A-002", "title": "十五号培训二", "on": "2026-10-15", "capacity": 2,
+            "remaining_seats": 0, "available": False, "conflict_activity_ids": ["A-001"],
+        })
+        # A-003 has free seats but the same-day completed enrollment conflicts.
+        self.assertEqual(rows[1], {
+            "activity_id": "A-003", "title": "十五号培训三", "on": "2026-10-15", "capacity": 3,
+            "remaining_seats": 2, "available": False, "conflict_activity_ids": ["A-001"],
+        })
+        # A-004 is full on a day 小陈 has no enrollment: full, no conflict.
+        self.assertEqual(rows[2], {
+            "activity_id": "A-004", "title": "二十已满员", "on": "2026-10-20", "capacity": 1,
+            "remaining_seats": 0, "available": False, "conflict_activity_ids": [],
+        })
+        # A-005 is the only genuinely available candidate.
+        self.assertEqual(rows[3], {
+            "activity_id": "A-005", "title": "二十有余位", "on": "2026-10-20", "capacity": 4,
+            "remaining_seats": 3, "available": True, "conflict_activity_ids": [],
+        })
+        # Other members' enrollments only drive remaining seats, never conflicts,
+        # and a member without any enrollment sees every activity as a candidate.
+        self.app.add_member("M-004", "小吴")
+        rows = self.app.enrollment_options("  M-004 ")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-001", "A-002", "A-003", "A-004", "A-005"])
+        self.assertTrue(all(r["conflict_activity_ids"] == [] for r in rows))
+        self.assertEqual([(r["activity_id"], r["remaining_seats"], r["available"]) for r in rows],
+                         [("A-001", 1, True), ("A-002", 0, False), ("A-003", 2, True),
+                          ("A-004", 0, False), ("A-005", 3, True)])
+
+    def test_enrollment_options_available_only_and_date_range(self):
+        self._options_ready()
+        rows = self.app.enrollment_options("M-001", available_only=True)
+        self.assertEqual([r["activity_id"] for r in rows], ["A-005"])
+        self.assertTrue(rows[0]["available"])
+        self.assertEqual(self.app.enrollment_options("M-001", available_only=False),
+                         self.app.enrollment_options("M-001"))
+        # Inclusive filtering on the activity date.
+        self.assertEqual([r["activity_id"] for r in self.app.enrollment_options("M-001", from_on="2026-10-20")],
+                         ["A-004", "A-005"])
+        self.assertEqual([r["activity_id"] for r in self.app.enrollment_options("M-001", to_on="2026-10-15")],
+                         ["A-002", "A-003"])
+        self.assertEqual([r["activity_id"] for r in self.app.enrollment_options("M-001", from_on="2026-10-15", to_on="2026-10-15")],
+                         ["A-002", "A-003"])
+        self.assertEqual([r["activity_id"] for r in self.app.enrollment_options("M-001", from_on=None, to_on=None)],
+                         ["A-002", "A-003", "A-004", "A-005"])
+        self.assertEqual(self.app.enrollment_options("M-001", from_on="2026-10-21"), [])
+        # Range plus availability: on the 15th nothing is available.
+        self.assertEqual(self.app.enrollment_options("M-001", from_on="2026-10-15", to_on="2026-10-15", available_only=True), [])
+        # 小林 is enrolled in A-002/A-003 (15th) and A-005 (20th): the two
+        # remaining candidates are conflicting, and the full A-004 also has
+        # A-005 as a same-day conflict, so none is available.
+        rows = self.app.enrollment_options("M-002")
+        self.assertEqual([(r["activity_id"], r["remaining_seats"], r["conflict_activity_ids"], r["available"]) for r in rows],
+                         [("A-001", 1, ["A-002", "A-003"], False),
+                          ("A-004", 0, ["A-005"], False)])
+        self.assertEqual(self.app.enrollment_options("M-002", available_only=True), [])
+
+    def test_enrollment_options_member_enrolled_in_everything_gets_empty(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.create_activity("A-001", "一", "2026-11-01", 4)
+        self.app.create_activity("A-002", "二", "2026-11-01", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-001")
+        self.assertEqual(self.app.enrollment_options("M-001"), [])
+        self.assertEqual(self.app.enrollment_options("M-001", available_only=True), [])
+        self.assertEqual(self.app.enrollment_options("M-001", from_on="2026-10-01", to_on="2026-12-31"), [])
+
+    def test_enrollment_options_conflict_ids_sorted_with_several_same_day(self):
+        self.app.add_member("M-001", "小陈")
+        for activity_id, title in [("A-003", "三"), ("A-001", "一"), ("A-002", "二")]:
+            self.app.create_activity(activity_id, title, "2026-11-01", 4)
+            self.app.enroll(activity_id, "M-001")
+        self.app.create_activity("A-004", "候选", "2026-11-01", 4)
+        self.app.create_activity("A-005", "他日", "2026-11-02", 4)
+        rows = self.app.enrollment_options("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-004", "A-005"])
+        self.assertEqual(rows[0]["conflict_activity_ids"], ["A-001", "A-002", "A-003"])
+        self.assertFalse(rows[0]["available"])
+        self.assertEqual(rows[1]["conflict_activity_ids"], [])
+        self.assertTrue(rows[1]["available"])
+
+    def test_enrollment_options_reflect_cancel_transfer_and_reschedule(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-001", "一号", "2026-11-01", 2)
+        self.app.create_activity("A-002", "二号", "2026-11-02", 2)
+        self.app.create_activity("A-003", "三号", "2026-11-03", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-003", "M-002")
+        self.assertEqual([(r["activity_id"], r["available"]) for r in self.app.enrollment_options("M-001")],
+                         [("A-002", True), ("A-003", True)])
+        # A transfer frees the source and occupies the target date.
+        self.app.transfer_enrollment("A-001", "A-002", "M-001")
+        rows = self.app.enrollment_options("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-001", "A-003"])
+        self.assertEqual(rows[0]["remaining_seats"], 2)
+        # Rescheduling the target onto A-003's date creates a conflict there.
+        self.app.reschedule_activity("A-002", "2026-11-03")
+        rows = self.app.enrollment_options("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-001", "A-003"])
+        self.assertEqual(rows[1]["conflict_activity_ids"], ["A-002"])
+        self.assertFalse(rows[1]["available"])
+        self.assertEqual(rows[1]["remaining_seats"], 1)
+        # A cancellation removes the same-day conflict but a full activity stays
+        # unavailable until its own seat frees up.
+        self.app.create_activity("A-004", "同日满员", "2026-11-05", 1)
+        self.app.create_activity("A-005", "五日之约", "2026-11-05", 2)
+        self.app.enroll("A-005", "M-001")
+        self.app.enroll("A-004", "M-002")
+        row = next(r for r in self.app.enrollment_options("M-001") if r["activity_id"] == "A-004")
+        self.assertEqual(row["remaining_seats"], 0)
+        self.assertEqual(row["conflict_activity_ids"], ["A-005"])
+        self.app.cancel_enrollments("M-002", ["A-004"])
+        self.app.cancel_enrollments("M-001", ["A-005"])
+        row = next(r for r in self.app.enrollment_options("M-001") if r["activity_id"] == "A-004")
+        self.assertEqual(row["remaining_seats"], 1)
+        self.assertEqual(row["conflict_activity_ids"], [])
+        self.assertTrue(row["available"])
+
+    def test_enrollment_options_rejections_never_modify_state(self):
+        self._options_ready()
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            {"member_id": "GHOST"},
+            {"member_id": " GHOST "},
+            {"member_id": 9},
+            {"member_id": None},
+            {"member_id": "   "},
+            {"member_id": "M-001", "from_on": 10},
+            {"member_id": "M-001", "to_on": "2026-02-30"},
+            {"member_id": "M-001", "from_on": " 2026-10-15"},
+            {"member_id": "M-001", "from_on": "2026/10/15"},
+            {"member_id": "M-001", "from_on": "2026-13-01"},
+            {"member_id": "M-001", "from_on": "2026-10-20", "to_on": "2026-10-15"},
+            {"member_id": "M-001", "available_only": "true"},
+            {"member_id": "M-001", "available_only": 1},
+            {"member_id": "M-001", "available_only": 0},
+            {"member_id": "M-001", "available_only": None},
+            {"member_id": "M-001", "available_only": "yes"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.enrollment_options(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # A successful query does not rewrite the file either.
+        self.app.enrollment_options("M-001", from_on="2026-10-01", to_on="2026-12-31", available_only=True)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_enrollment_options_unknown_member_does_not_create_empty_dir(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.enrollment_options("GHOST")
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_enrollment_options_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 1)
+        other.create_activity("A-002", "新活动", "2026-10-16", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        rows = TeamPlanner(legacy).enrollment_options("M-001")
+        self.assertEqual([r["activity_id"] for r in rows], ["A-002"])
+        self.assertTrue(rows[0]["available"])
+        self.assertEqual(rows[0]["remaining_seats"], 2)
+
+    def test_cli_enrollment_options_object_array_and_failure(self):
+        self._options_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "enrollment-options", name], text=True, capture_output=True)
+        ok = run({"member_id": "M-001", "available_only": True})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([r["activity_id"] for r in json.loads(ok.stdout)], ["A-005"])
+        self.app.add_member("M-004", "小吴")
+        batch = run([{"member_id": "M-001"}, {"member_id": " M-004 "}])
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([r["activity_id"] for r in values[0]], ["A-002", "A-003", "A-004", "A-005"])
+        self.assertEqual([r["activity_id"] for r in values[1]], ["A-001", "A-002", "A-003", "A-004", "A-005"])
+        for payload in [
+            {"member_id": "GHOST"},
+            {"member_id": "M-001", "from_on": "2026-10-20", "to_on": "2026-10-15"},
+            {"member_id": "M-001", "available_only": "true"},
+        ]:
+            failed = run(payload)
+            self.assertEqual(failed.returncode, 2)
+            self.assertIn("error", json.loads(failed.stderr))
+            self.assertEqual(failed.stdout, "")
+        # A failing array produces no partial output on stdout.
+        partial = run([{"member_id": "M-001"}, {"member_id": "GHOST"}])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+
 if __name__ == "__main__":
     unittest.main()

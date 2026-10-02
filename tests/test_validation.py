@@ -160,6 +160,7 @@ class ValidationTests(unittest.TestCase):
             lambda: self.app.activities(),
             lambda: self.app.roster("A-001"),
             lambda: self.app.member_schedule("M-001"),
+            lambda: self.app.enrollment_options("M-001"),
             lambda: self.app.completions("M-001"),
             lambda: self.app.add_member("M-999", "新人"),
             lambda: self.app.enroll("A-001", "M-001"),
@@ -210,6 +211,8 @@ class ValidationTests(unittest.TestCase):
         self.write(document)
         with self.assertRaises(ValueError):
             self.app.member_schedule("M-001")
+        with self.assertRaises(ValueError):
+            self.app.enrollment_options("M-001")
         with self.assertRaises(ValueError):
             self.app.completions("M-001")
         with self.assertRaises(ValueError):
@@ -272,6 +275,12 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertEqual(len(json.loads(ok.stdout)), 3)
 
+        # A history without completions is compatible: 小陈 is enrolled in all
+        # three activities, so the candidate list is empty rather than an error.
+        options_ok = run("enrollment-options", {"member_id": "M-001"})
+        self.assertEqual(options_ok.returncode, 0, options_ok.stderr)
+        self.assertEqual(json.loads(options_ok.stdout), [])
+
         bad = {"members": {"M-001": {"member_id": "M-001", "name": "小陈"}},
                "activities": {"A-001": {"activity_id": "A-001", "title": "培训", "on": "2026-10-15", "capacity": 2, "participants": ["M-GHOST"]}}}
         self.write(bad)
@@ -285,6 +294,13 @@ class ValidationTests(unittest.TestCase):
         bad["completions"] = {"A-001": {"M-001": "2026-10-14"}}
         self.write(bad)
         failed = run("completions", {"member_id": "M-001"})
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
+        # The candidate query applies the same whole-history validation and
+        # cannot hide the early completion record behind its filters.
+        failed = run("enrollment-options", {"member_id": "M-001", "from_on": "2026-10-01", "to_on": "2026-12-31", "available_only": True})
         self.assertEqual(failed.returncode, 2)
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
