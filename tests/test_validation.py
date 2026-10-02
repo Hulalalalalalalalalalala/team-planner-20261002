@@ -193,6 +193,45 @@ class ValidationTests(unittest.TestCase):
             ])
         self.assertEqual(self.app.path.read_bytes(), before)
 
+    def test_correct_completions_also_rejects_broken_history(self):
+        # Correcting runs the same whole-history validation: a valid group
+        # against a broken document fails with ValueError and leaves the bytes.
+        good_records = [{"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-16"}]
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.correct_completions(good_records)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken group (duplicate pair) fails argument validation before the
+        # filesystem is even touched, so the valid history stays byte-identical.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.correct_completions([
+                {"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-16"},
+                {"activity_id": " A-003 ", "member_id": " M-001 ", "completed_on": None},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_completions_missing_completions_field_has_nothing(self):
+        # An old file without a completions field means zero records, so every
+        # correction is rejected and the file is not created or rewritten.
+        document = {"members": {"M-001": {"member_id": "M-001", "name": "小陈"}},
+                    "activities": {"A-001": {"activity_id": "A-001", "title": "培训", "on": "2026-10-15", "capacity": 2, "participants": ["M-001"]}}}
+        before = self.write(document)
+        for completed_on in ["2026-10-16", None]:
+            with self.assertRaises(ValueError):
+                self.app.correct_completions([{"activity_id": "A-001", "member_id": "M-001", "completed_on": completed_on}])
+            self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correct_completions_os_error_stays_an_os_error(self):
+        # data.json itself being a directory stays an operating-system error.
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.correct_completions([{"activity_id": "A-001", "member_id": "M-001", "completed_on": None}])
+
     def test_unrelated_broken_record_is_not_hidden_by_filters(self):
         # Querying M-001's own data must still fail because of M-002's broken
         # profile and A-002's broken completion record.

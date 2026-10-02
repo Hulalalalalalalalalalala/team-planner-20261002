@@ -302,6 +302,243 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(sorted(r["activity_id"] for r in reopened.completions("M-001")), ["A-001", "A-003"])
         self.assertEqual(reopened.completions("M-003")[0]["completed_on"], "2026-10-15")
 
+    def _correct_ready(self):
+        # Fictional fixed dates: on 2026-10-15 A-001 holds 小陈 (finished on
+        # the 16th) and A-002 holds 小周 (finished on the day) and 小林
+        # (pending); A-003 on the 20th holds 小陈 (finished on the day).
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "新成员产品介绍", "2026-10-15", 2)
+        self.app.create_activity("A-002", "安全规范", "2026-10-15", 2)
+        self.app.create_activity("A-003", "团队协作", "2026-10-20", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-003")
+        self.app.enroll("A-002", "M-002")
+        self.app.enroll("A-003", "M-001")
+        self.app.record_completion("A-001", "M-001", "2026-10-16")
+        self.app.record_completion("A-002", "M-003", "2026-10-15")
+        self.app.record_completion("A-003", "M-001", "2026-10-20")
+
+    def test_correct_completions_cross_activity_change_and_revoke(self):
+        self._correct_ready()
+        # Identifiers are trimmed; one entry moves a date and another revokes
+        # (null) across activities. Dates never depend on the current date.
+        result = self.app.correct_completions([
+            {"activity_id": " A-001 ", "member_id": "M-001", "completed_on": "2026-10-18"},
+            {"activity_id": "A-002", "member_id": " M-003 ", "completed_on": None},
+        ])
+        self.assertEqual(result, [
+            {"activity_id": "A-001", "member_id": "M-001", "title": "新成员产品介绍", "on": "2026-10-15", "previous_completed_on": "2026-10-16", "completed_on": "2026-10-18"},
+            {"activity_id": "A-002", "member_id": "M-003", "title": "安全规范", "on": "2026-10-15", "previous_completed_on": "2026-10-15", "completed_on": None},
+        ])
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([(r["activity_id"], r["completed_on"]) for r in reopened.completions("M-001")],
+                         [("A-001", "2026-10-18"), ("A-003", "2026-10-20")])
+        self.assertEqual(reopened.completions("M-003"), [])
+        # schedule and export immediately reflect the new date and the
+        # unfinished status.
+        rows = {r["activity_id"]: r for r in reopened.member_schedule("M-003")}
+        self.assertEqual(rows["A-002"]["status"], "pending")
+        self.assertIsNone(rows["A-002"]["completed_on"])
+        self.assertEqual(reopened.export_schedule(status="completed")["row_count"], 2)
+        self.assertEqual(reopened.export_schedule(status="pending")["row_count"], 2)
+        # Revocation neither cancels the enrollment nor frees the seat, and
+        # participant order is untouched.
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-003", "M-002"])
+        # After revoking, the record can be registered again; it blocks
+        # rescheduling like any completion, and revoking it once more restores
+        # the original rules for reschedule and transfer.
+        reopened.record_completion("A-002", "M-003", "2026-10-16")
+        self.assertEqual(reopened.completions("M-003")[0]["completed_on"], "2026-10-16")
+        with self.assertRaises(ValueError):
+            reopened.reschedule_activity("A-002", "2026-10-22")
+        reopened.correct_completions([{"activity_id": "A-002", "member_id": "M-003", "completed_on": None}])
+        reopened.reschedule_activity("A-002", "2026-10-22")
+        reopened.transfer_enrollment("A-002", "A-003", "M-003")
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-003")["members"]], ["M-001", "M-003"])
+        # Other members' records are untouched by all of this.
+        self.assertEqual([(r["activity_id"], r["completed_on"]) for r in reopened.completions("M-001")],
+                         [("A-001", "2026-10-18"), ("A-003", "2026-10-20")])
+
+    def test_correct_completions_same_date_succeeds_without_rewrite(self):
+        self._correct_ready()
+        before = self.app.path.read_bytes()
+        result = self.app.correct_completions([
+            {"activity_id": " A-001 ", "member_id": "M-001", "completed_on": "2026-10-16"},
+        ])
+        self.assertEqual(result[0]["previous_completed_on"], "2026-10-16")
+        self.assertEqual(result[0]["completed_on"], "2026-10-16")
+        # Equal old and new date is a success but changes nothing.
+        self.assertEqual(before, self.app.path.read_bytes())
+        # A mixed group still reports the no-op entry while applying the real
+        # change in the other entry.
+        mixed = self.app.correct_completions([
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-16"},
+            {"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-21"},
+        ])
+        self.assertEqual([(r["previous_completed_on"], r["completed_on"]) for r in mixed],
+                         [("2026-10-16", "2026-10-16"), ("2026-10-20", "2026-10-21")])
+        saved = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["completions"]["A-001"]["M-001"], "2026-10-16")
+        self.assertEqual(saved["completions"]["A-003"]["M-001"], "2026-10-21")
+
+    def test_correct_completions_rejections_are_atomic(self):
+        self._correct_ready()
+        before = self.app.path.read_bytes()
+        for records in [
+            None,
+            [],
+            "x",
+            3,
+            {},
+            [42],
+            [None],
+            [[]],
+            [{"activity_id": "A-001", "member_id": "M-001"}],
+            [{"activity_id": "A-001", "completed_on": "2026-10-17"}],
+            [{"member_id": "M-001", "completed_on": "2026-10-17"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-17", "extra": 1}],
+            [{"activity_id": "   ", "member_id": "M-001", "completed_on": "2026-10-17"}],
+            [{"activity_id": 9, "member_id": "M-001", "completed_on": "2026-10-17"}],
+            [{"activity_id": "A-001", "member_id": None, "completed_on": "2026-10-17"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-02-30"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": " 2026-10-17"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-17 "}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": 10}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": True}],
+            [{"activity_id": "GHOST", "member_id": "M-001", "completed_on": "2026-10-17"}],
+            [{"activity_id": "A-001", "member_id": "GHOST", "completed_on": None}],
+            [{"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-15"}],  # not enrolled
+            [{"activity_id": "A-002", "member_id": "M-002", "completed_on": "2026-10-15"}],  # enrolled, no record
+            [{"activity_id": "A-002", "member_id": "M-002", "completed_on": None}],         # nothing to revoke
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-14"}],  # before activity date
+            [{"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-19"}],
+            # Duplicate activity/member pair after trimming: same date is no merge.
+            [{"activity_id": " A-001 ", "member_id": "M-001", "completed_on": "2026-10-17"},
+             {"activity_id": "A-001", "member_id": " M-001 ", "completed_on": "2026-10-17"}],
+            # The last entry has no own record; the first (valid) change is
+            # rejected with the whole group.
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-17"},
+             {"activity_id": "A-002", "member_id": "M-002", "completed_on": "2026-10-15"}],
+            # The first entry fails; a valid later entry cannot save it.
+            [{"activity_id": "A-002", "member_id": "M-002", "completed_on": None},
+             {"activity_id": "A-003", "member_id": "M-001", "completed_on": None}],
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.correct_completions(records)
+            self.assertEqual(before, self.app.path.read_bytes())
+        # Nothing from any rejected group survived.
+        self.assertEqual([(r["activity_id"], r["completed_on"]) for r in self.app.completions("M-001")],
+                         [("A-001", "2026-10-16"), ("A-003", "2026-10-20")])
+        self.assertEqual([(r["activity_id"], r["completed_on"]) for r in self.app.completions("M-003")],
+                         [("A-002", "2026-10-15")])
+        self.assertEqual(self.app.completions("M-002"), [])
+
+    def test_invalid_correct_completions_does_not_create_file(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for records in [
+            [],
+            "x",
+            [42],
+            [{"activity_id": "A", "member_id": "B"}],
+            [{"activity_id": "A", "member_id": "B", "completed_on": "nope"}],
+            [{"activity_id": "A", "member_id": "B", "completed_on": None}],
+        ]:
+            with self.assertRaises(ValueError):
+                fresh.correct_completions(records)
+        # A well-formed group against a missing history fails the business
+        # rules and must not create the directory or data.json either.
+        with self.assertRaises(ValueError):
+            fresh.correct_completions([{"activity_id": "A", "member_id": "B", "completed_on": "2026-10-15"}])
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_correct_completions_legacy_and_extra_fields_preserved(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        # An old file without completions holds nothing correctable and stays
+        # byte-identical.
+        before = (legacy / "data.json").read_bytes()
+        with self.assertRaises(ValueError):
+            TeamPlanner(legacy).correct_completions([
+                {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-16"},
+            ])
+        self.assertEqual((legacy / "data.json").read_bytes(), before)
+        # A historical document carrying extra fields and another member's
+        # record: only the selected date changes, everything else survives.
+        other.add_member("M-002", "小林")
+        other.enroll("A-001", "M-002")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        raw["note"] = "imported from the old planner"
+        raw["members"]["M-001"]["team"] = "平台"
+        raw["activities"]["A-001"]["location"] = "一号会议室"
+        raw["completions"] = {"A-001": {"M-001": "2026-10-15", "M-002": "2026-10-17"}}
+        (legacy / "data.json").write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        result = TeamPlanner(legacy).correct_completions([
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-18"},
+        ])
+        self.assertEqual(result[0]["previous_completed_on"], "2026-10-15")
+        self.assertEqual(result[0]["completed_on"], "2026-10-18")
+        saved = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["note"], "imported from the old planner")
+        self.assertEqual(saved["members"]["M-001"]["team"], "平台")
+        self.assertEqual(saved["activities"]["A-001"]["location"], "一号会议室")
+        self.assertEqual(saved["activities"]["A-001"]["participants"], ["M-001", "M-002"])
+        self.assertEqual(saved["completions"]["A-001"], {"M-001": "2026-10-18", "M-002": "2026-10-17"})
+        # Revoking 小陈 removes only his record; 小林's record and the inner
+        # completion object both remain.
+        TeamPlanner(legacy).correct_completions([
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": None},
+        ])
+        saved = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["completions"]["A-001"], {"M-002": "2026-10-17"})
+        self.assertEqual([m["member_id"] for m in TeamPlanner(legacy).roster("A-001")["members"]], ["M-001", "M-002"])
+
+    def test_cli_correct_completions_object_and_partial_array(self):
+        self._correct_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "correct-completions", name], text=True, capture_output=True)
+        ok = run({"records": [
+            {"activity_id": " A-001 ", "member_id": "M-001", "completed_on": "2026-10-18"},
+            {"activity_id": "A-002", "member_id": " M-003 ", "completed_on": None},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([(r["activity_id"], r["previous_completed_on"], r["completed_on"]) for r in json.loads(ok.stdout)],
+                         [("A-001", "2026-10-16", "2026-10-18"), ("A-002", "2026-10-15", None)])
+        # 小林 has no own record in A-002: the call fails with error JSON.
+        missing = run({"records": [{"activity_id": "A-002", "member_id": "M-002", "completed_on": None}]})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        self.assertEqual(missing.stdout, "")
+        bad_shape = run({"records": []})
+        self.assertEqual(bad_shape.returncode, 2)
+        self.assertIn("error", json.loads(bad_shape.stderr))
+        # Top-level array: independent batches. The first batch succeeds
+        # (小陈's A-003 date moves); the second fails on an unknown member,
+        # processing stops with empty stdout and the error on stderr, while the
+        # first batch's change stays.
+        partial = run([
+            {"records": [{"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-21"}]},
+            {"records": [{"activity_id": "A-001", "member_id": "GHOST", "completed_on": None}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([(r["activity_id"], r["completed_on"]) for r in reopened.completions("M-001")],
+                         [("A-001", "2026-10-18"), ("A-003", "2026-10-21")])
+        self.assertEqual(reopened.completions("M-003"), [])
+
     def _transfer_ready(self):
         # A-001 on the 15th is full with 小陈 and 小林; A-002 on the 16th
         # still has free seats and 小周 is already enrolled.

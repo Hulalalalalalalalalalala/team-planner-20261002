@@ -348,6 +348,73 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return result
 
+    def correct_completions(self, records):
+        # The whole group takes effect at once: every entry is normalized and
+        # checked before any stored record is changed.
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "member_id", "completed_on"}:
+                raise ValueError("each record must contain only activity_id, member_id and completed_on")
+            activity_id = text(item["activity_id"], "activity_id")
+            member_id = text(item["member_id"], "member_id")
+            # null revokes the record; any other value must be a strict, real
+            # YYYY-MM-DD date exactly like a fresh completion entry.
+            completed_on = None if item["completed_on"] is None else day(item["completed_on"], "completed_on")
+            # A repeated activity/member pair rejects the whole group even when
+            # both entries set the same date; same-date entries are not merged.
+            pair = (activity_id, member_id)
+            if pair in seen:
+                raise ValueError("records must not contain duplicate activity and member pairs")
+            seen.add(pair)
+            entries.append((activity_id, member_id, completed_on))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        done = data.get("completions", {})
+        # Validate every entry first: the activity and member must exist, the
+        # member must stay enrolled, and the member's own record must already
+        # exist so it can be corrected. A new date must not precede the
+        # activity date; revocation (null) carries no date check.
+        previous = []
+        for activity_id, member_id, completed_on in entries:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            if member_id not in members:
+                raise ValueError("unknown member")
+            if member_id not in activity.get("participants", []):
+                raise ValueError("member is not enrolled in the activity")
+            record = done.get(activity_id, {}).get(member_id)
+            if record is None:
+                raise ValueError("no completion record to correct")
+            previous.append(record)
+            if completed_on is not None and date.fromisoformat(completed_on) < date.fromisoformat(activity["on"]):
+                raise ValueError("completed_on must be on or after the activity date")
+        # Only the selected records change: a new date replaces the old one and
+        # null deletes just that member's record. Enrollments keep occupying
+        # capacity and participant order; profiles, activity fields (including
+        # extra fields) and other members' records are left untouched.
+        changed = False
+        result = []
+        for (activity_id, member_id, completed_on), old in zip(entries, previous):
+            activity = activities[activity_id]
+            records_for_activity = done[activity_id]
+            if completed_on is None:
+                del records_for_activity[member_id]
+            else:
+                records_for_activity[member_id] = completed_on
+            if completed_on != old:
+                changed = True
+            result.append({"activity_id": activity_id, "member_id": member_id, "title": activity["title"], "on": activity["on"], "previous_completed_on": old, "completed_on": completed_on})
+        # A group where every date already equals the stored one succeeds but
+        # leaves the file untouched, like a same-date reschedule.
+        if changed:
+            self._write(data)
+        return result
+
     def completions(self, member_id):
         member_id = text(member_id, "member_id")
         data = self._read()
