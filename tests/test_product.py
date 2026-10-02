@@ -422,5 +422,173 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(partial.stderr))
         self.assertEqual(partial.stdout, "")
 
+    def _cancel_ready(self):
+        # On 2026-10-15 小陈 is in three activities, two of them shared:
+        # A-001 is full with 小陈 and 小林, A-002 also has 小周, A-004 only
+        # 小陈. A-003 on the 20th is 小陈's alone.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训一", "2026-10-15", 2)
+        self.app.create_activity("A-002", "十五号培训二", "2026-10-15", 3)
+        self.app.create_activity("A-003", "二十号培训", "2026-10-20", 2)
+        self.app.create_activity("A-004", "十五号培训三", "2026-10-15", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-001", "M-002")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-002", "M-003")
+        self.app.enroll("A-003", "M-001")
+        self.app.enroll("A-004", "M-001")
+
+    def test_cancel_batch_returns_activities_in_input_order(self):
+        self._cancel_ready()
+        result = self.app.cancel_enrollments("M-001", [" A-002 ", "A-001"])
+        self.assertEqual(result, [
+            {"activity_id": "A-002", "title": "十五号培训二", "on": "2026-10-15", "capacity": 3, "participants": ["M-003"]},
+            {"activity_id": "A-001", "title": "十五号培训一", "on": "2026-10-15", "capacity": 2, "participants": ["M-002"]},
+        ])
+        # Only 小陈 is removed; everyone else keeps their relative position and
+        # titles, dates and capacities are unchanged.
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-002"])
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-002")["members"]], ["M-003"])
+        listing = {a["activity_id"]: a for a in self.app.activities()}
+        self.assertEqual(listing["A-001"]["participants"], ["M-002"])
+        self.assertEqual(listing["A-002"]["participants"], ["M-003"])
+        self.assertEqual(listing["A-001"]["capacity"], 2)
+        # The canceled activities leave the schedule; remaining same-day
+        # enrollments keep fewer (here: no) conflicts.
+        rows = self.app.member_schedule("M-001")
+        self.assertEqual([(r["activity_id"], r["conflict_activity_ids"]) for r in rows], [("A-004", []), ("A-003", [])])
+        # The change survives reopening the same root.
+        reopened = TeamPlanner(self.root)
+        self.assertEqual(reopened.roster("A-001")["members"], [{"member_id": "M-002", "name": "小林"}])
+        self.assertEqual([r["activity_id"] for r in reopened.member_schedule("M-001")], ["A-004", "A-003"])
+
+    def test_cancel_frees_full_seat_for_enroll_and_transfer(self):
+        self._cancel_ready()
+        self.app.cancel_enrollments("M-001", ["A-001", "A-002", "A-004"])
+        # A-001 was full: the freed seat can immediately be taken.
+        self.app.enroll("A-001", "M-003")
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-002", "M-003"])
+        # A transfer can claim a freed seat as well.
+        self.app.create_activity("A-005", "二十一号培训", "2026-10-21", 2)
+        self.app.enroll("A-005", "M-001")
+        self.app.transfer_enrollment("A-005", "A-002", "M-001")
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-002")["members"]], ["M-003", "M-001"])
+
+    def test_cancel_completion_rules(self):
+        self._cancel_ready()
+        # Another member's completion record does not block 小陈's cancellation
+        # and the record itself is preserved.
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        self.app.cancel_enrollments("M-001", ["A-001"])
+        self.assertEqual([r["member_id"] for r in self.app.completions("M-002")], ["M-002"])
+        # 小陈's own completion in a non-selected activity does not matter.
+        self.app.record_completion("A-003", "M-001", "2026-10-20")
+        self.app.cancel_enrollments("M-001", ["A-002"])
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-001")], ["A-003"])
+        # A past activity without a completion record can still be canceled;
+        # the operation does not depend on the current date.
+        self.app.create_activity("A-OLD", "九月培训", "2026-09-01", 2)
+        self.app.enroll("A-OLD", "M-001")
+        self.assertEqual(self.app.cancel_enrollments("M-001", ["A-OLD"])[0]["participants"], [])
+
+    def test_cancel_own_completion_is_atomic_rejection(self):
+        self._cancel_ready()
+        self.app.record_completion("A-002", "M-001", "2026-10-15")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.cancel_enrollments("M-001", ["A-001", "A-002"])
+        # Neither roster is touched and the completion record stays.
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-001", "M-002"])
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-002")["members"]], ["M-001", "M-003"])
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-001")], ["A-002"])
+
+    def test_cancel_rejections_leave_state_unchanged(self):
+        self._cancel_ready()
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            {"member_id": "GHOST", "activity_ids": ["A-001"]},
+            {"member_id": " GHOST ", "activity_ids": ["A-001"]},
+            {"member_id": "M-001", "activity_ids": ["GHOST"]},
+            {"member_id": "M-001", "activity_ids": ["A-001", "GHOST"]},
+            {"member_id": "M-002", "activity_ids": ["A-002"]},  # not enrolled
+            {"member_id": 9, "activity_ids": ["A-001"]},
+            {"member_id": None, "activity_ids": ["A-001"]},
+            {"member_id": "   ", "activity_ids": ["A-001"]},
+            {"member_id": "M-001", "activity_ids": "A-001"},
+            {"member_id": "M-001", "activity_ids": None},
+            {"member_id": "M-001", "activity_ids": []},
+            {"member_id": "M-001", "activity_ids": ["A-001", 7]},
+            {"member_id": "M-001", "activity_ids": ["   "]},
+            {"member_id": "M-001", "activity_ids": ["A-001", " A-001 "]},  # duplicates after trim
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.cancel_enrollments(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_invalid_cancel_does_not_create_file(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for kwargs in [
+            {"member_id": "M-001", "activity_ids": []},
+            {"member_id": "M-001", "activity_ids": ["A-001"]},
+            {"member_id": "GHOST", "activity_ids": ["A-001"]},
+        ]:
+            with self.assertRaises(ValueError):
+                fresh.cancel_enrollments(**kwargs)
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_cancel_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动一", "2026-10-15", 2)
+        other.create_activity("A-002", "旧活动二", "2026-10-16", 2)
+        other.enroll("A-001", "M-001")
+        other.enroll("A-002", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        result = TeamPlanner(legacy).cancel_enrollments("M-001", ["A-002", "A-001"])
+        self.assertEqual([a["activity_id"] for a in result], ["A-002", "A-001"])
+        self.assertTrue(all(a["participants"] == [] for a in result))
+
+    def test_cli_cancel_object_array_and_partial_failure(self):
+        self._cancel_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "cancel", name], text=True, capture_output=True)
+        ok = run({"member_id": "M-001", "activity_ids": [" A-002 ", "A-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([a["activity_id"] for a in json.loads(ok.stdout)], ["A-002", "A-001"])
+        repeat = run({"member_id": "M-001", "activity_ids": ["A-001"]})
+        self.assertEqual(repeat.returncode, 2)
+        self.assertIn("error", json.loads(repeat.stderr))
+        # An all-success array outputs an array of per-call result arrays.
+        self.app.enroll("A-002", "M-001")
+        batch = run([
+            {"member_id": "M-001", "activity_ids": ["A-002"]},
+            {"member_id": "M-002", "activity_ids": ["A-001"]},
+        ])
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([call[0]["activity_id"] for call in values], ["A-002", "A-001"])
+        self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], [])
+        # A failing array stops after the first failure: its success is kept,
+        # stdout stays empty and the error goes to stderr.
+        self.app.enroll("A-001", "M-001")
+        partial = run([
+            {"member_id": "M-001", "activity_ids": ["A-001"]},
+            {"member_id": "M-001", "activity_ids": ["GHOST"]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], [])
+
 if __name__ == "__main__":
     unittest.main()

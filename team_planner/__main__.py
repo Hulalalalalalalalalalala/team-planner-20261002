@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import TeamPlanner
 
-ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'transfer': 'transfer_enrollment', 'reschedule': 'reschedule_activity', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'completions': 'completions', 'merge': 'merge_member', 'schedule': 'member_schedule'}
+ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'cancel': 'cancel_enrollments', 'transfer': 'transfer_enrollment', 'reschedule': 'reschedule_activity', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'completions': 'completions', 'merge': 'merge_member', 'schedule': 'member_schedule'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))
@@ -15,6 +15,42 @@ def demo(app):
         app.add_member(**member)
     app.create_activity(**samples("activity.json"))
     app.enroll(**samples("enrollment.json"))
+    # 2026-10-15 的虚构安排：A-002 与 A-001 同日，由小陈和小周报满；
+    # 小陈在 A-003 已登记完成，报名仍然保留，当天原本互为冲突。
+    app.create_activity("A-002", "安全规范", "2026-10-15", 2)
+    app.create_activity("A-003", "团队协作", "2026-10-15", 2)
+    app.enroll("A-002", "M-001")
+    app.enroll("A-002", "M-003")
+    app.enroll("A-003", "M-001")
+    app.record_completion("A-003", "M-001", "2026-10-15")
+    # 一次取消两场，标识带首尾空白也会先去除；满员的 A-002 释放席位，
+    # 返回顺序与输入一致，且各活动只移除小陈本人。
+    cancelled = app.cancel_enrollments("M-001", [" A-002 ", "A-001"])
+    if [a["activity_id"] for a in cancelled] != ["A-002", "A-001"]:
+        raise ValueError("demo: cancelled activities must follow the input order")
+    if cancelled[0]["participants"] != ["M-003"] or cancelled[1]["participants"] != []:
+        raise ValueError("demo: only the cancelling member is removed")
+    # 取消后小陈只剩已完成的 A-003，同日冲突随之消失。
+    schedule = app.member_schedule("M-001")
+    if [r["activity_id"] for r in schedule] != ["A-003"] or schedule[0]["conflict_activity_ids"] != []:
+        raise ValueError("demo: same-day conflicts must disappear after cancellation")
+    # 释放的席位立即可用：小林报进原本满员的 A-002，小陈重新报回 A-001。
+    app.enroll("A-002", "M-002")
+    app.enroll("A-001", "M-001")
+    # 小陈在 A-003 已有本人完成记录：整次取消被拒绝，两边名单均不变，
+    # 完成记录继续保留。
+    try:
+        app.cancel_enrollments("M-001", ["A-001", "A-003"])
+    except ValueError:
+        pass
+    else:
+        raise ValueError("demo: cancelling a completed activity must fail")
+    if [m["member_id"] for m in app.roster("A-001")["members"]] != ["M-001"]:
+        raise ValueError("demo: rosters must stay unchanged after a rejected cancellation")
+    if [m["member_id"] for m in app.roster("A-003")["members"]] != ["M-001"]:
+        raise ValueError("demo: the completed activity roster must stay unchanged")
+    if [r["activity_id"] for r in app.completions("M-001")] != ["A-003"]:
+        raise ValueError("demo: completion records must be kept")
     return app.roster("A-001")
 
 def main(argv=None):

@@ -72,6 +72,44 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return target
 
+    def cancel_enrollments(self, member_id, activity_ids):
+        member_id = text(member_id, "member_id")
+        if not isinstance(activity_ids, list) or not activity_ids:
+            raise ValueError("activity_ids must be a nonempty array")
+        ids = []
+        seen = set()
+        for activity_id in activity_ids:
+            activity_id = text(activity_id, "activity_id")
+            if activity_id in seen:
+                raise ValueError("activity_ids must not contain duplicates")
+            seen.add(activity_id)
+            ids.append(activity_id)
+        data = self._read()
+        activities = data.get("activities", {})
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        selected = []
+        # Validate every selected activity first: existence, an enrollment of
+        # this member, and no own completion record. Other members' records do
+        # not block the cancellation; the whole call takes effect only when all
+        # conditions hold.
+        for activity_id in ids:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            if member_id not in activity.get("participants", []):
+                raise ValueError("member is not enrolled in the activity")
+            if member_id in data.get("completions", {}).get(activity_id, {}):
+                raise ValueError("member has a completion record for the activity")
+            selected.append(activity)
+        # Removing the member keeps everyone else's relative order; titles,
+        # dates and capacities are untouched. Completion records stay as they
+        # are and the freed seats are usable immediately.
+        for activity in selected:
+            activity["participants"].remove(member_id)
+        self._write(data)
+        return selected
+
     def reschedule_activity(self, activity_id, on):
         activity_id = text(activity_id, "activity_id")
         on = day(on, "on")
