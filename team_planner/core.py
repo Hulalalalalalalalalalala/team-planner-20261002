@@ -729,6 +729,94 @@ class TeamPlanner(JsonStore):
             })
         return sorted(options, key=lambda r: (r["on"], r["activity_id"]))
 
+    def training_progress(self, activity_ids, as_of, member_ids=None):
+        # Read-only multi-member reconciliation: one cutoff date applies only
+        # to completion dates; current rosters and profiles are used as they
+        # are, never reconstructed historically.
+        if not isinstance(activity_ids, list) or not activity_ids:
+            raise ValueError("activity_ids must be a nonempty array")
+        selected_ids = []
+        seen_activities = set()
+        for activity_id in activity_ids:
+            activity_id = text(activity_id, "activity_id")
+            if activity_id in seen_activities:
+                raise ValueError("activity_ids must not contain duplicates")
+            seen_activities.add(activity_id)
+            selected_ids.append(activity_id)
+        as_of = day(as_of, "as_of")
+        # member_ids omitted or null means every member; an empty array means
+        # no members at all. Given ids are returned in input order.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        selected_activities = []
+        for activity_id in selected_ids:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            selected_activities.append(activity)
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        cutoff = date.fromisoformat(as_of)
+        rows = []
+        for member_id in ordered_member_ids:
+            trainings = []
+            completed_count = 0
+            for activity_id, activity in zip(selected_ids, selected_activities):
+                # A stored completion only exists for enrolled members; the
+                # enrollment check still decides the status on its own so a
+                # missing record is the same as no record.
+                completed_on = completions.get(activity_id, {}).get(member_id)
+                if member_id not in activity.get("participants", []):
+                    status = "not_enrolled"
+                    completed_on = None
+                elif completed_on is not None and date.fromisoformat(completed_on) <= cutoff:
+                    # The cutoff only counts the record; the original date is
+                    # reported unchanged. A later record stays visible below.
+                    status = "completed"
+                    completed_count += 1
+                else:
+                    # Enrolled with no record, or with a record dated after the
+                    # cutoff: pending and still missing.
+                    status = "pending"
+                trainings.append({
+                    "activity_id": activity_id,
+                    "title": activity["title"],
+                    "on": activity["on"],
+                    "status": status,
+                    "completed_on": completed_on,
+                })
+            rows.append({
+                "member_id": member_id,
+                "name": members[member_id]["name"],
+                "completed_count": completed_count,
+                # Not enrolled counts as missing too; future activities stay
+                # among the required items.
+                "remaining_count": len(selected_activities) - completed_count,
+                "trainings": trainings,
+            })
+        return {"as_of": as_of, "required_count": len(selected_activities), "members": rows}
+
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
             from_on = day(from_on, "from_on")
