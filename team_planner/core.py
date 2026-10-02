@@ -72,6 +72,40 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return target
 
+    def cancel_enrollments(self, member_id, activity_ids):
+        member_id = text(member_id, "member_id")
+        if not isinstance(activity_ids, list) or not activity_ids:
+            raise ValueError("activity_ids must be a nonempty array")
+        activity_ids = [text(activity_id, "activity_id") for activity_id in activity_ids]
+        if len(set(activity_ids)) != len(activity_ids):
+            raise ValueError("activity_ids must not contain duplicates")
+        data = self._read()
+        if member_id not in data.get("members", {}):
+            raise ValueError("unknown member")
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Validate every activity before touching any participant list, so a
+        # failure anywhere leaves the whole batch unchanged.
+        targets = []
+        for activity_id in activity_ids:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            if member_id not in activity.get("participants", []):
+                raise ValueError("member is not enrolled in the activity")
+            # The member's own completion record blocks the cancel; other
+            # members' records and records on unselected activities do not.
+            if member_id in completions.get(activity_id, {}):
+                raise ValueError("member has a completion record for the activity")
+            targets.append(activity)
+        # Cancellation does not depend on the current date: a past activity
+        # without a completion record can still be withdrawn. Only the member
+        # is removed; everyone else keeps their relative order.
+        for activity in targets:
+            activity["participants"].remove(member_id)
+        self._write(data)
+        return targets
+
     def reschedule_activity(self, activity_id, on):
         activity_id = text(activity_id, "activity_id")
         on = day(on, "on")

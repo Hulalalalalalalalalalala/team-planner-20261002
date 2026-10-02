@@ -422,5 +422,139 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(partial.stderr))
         self.assertEqual(partial.stdout, "")
 
+    def _cancel_ready(self):
+        # 小陈 is enrolled in the full A-001 and in A-002, both on the 15th,
+        # and in A-003 on the 20th; 小林 shares A-002, 小周 shares A-003.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训一", "2026-10-15", 1)
+        self.app.create_activity("A-002", "十五号培训二", "2026-10-15", 3)
+        self.app.create_activity("A-003", "二十号培训", "2026-10-20", 3)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-002", "M-002")
+        self.app.enroll("A-003", "M-001")
+        self.app.enroll("A-003", "M-003")
+
+    def test_cancel_enrollments_success_frees_seat_and_clears_conflict(self):
+        self._cancel_ready()
+        # Before the cancel the two same-day enrollments conflict.
+        before = {r["activity_id"]: r["conflict_activity_ids"] for r in self.app.member_schedule("M-001")}
+        self.assertEqual(before, {"A-001": ["A-002"], "A-002": ["A-001"], "A-003": []})
+        result = self.app.cancel_enrollments(" M-001 ", [" A-001 ", "A-003"])
+        # Full updated activity objects come back in input order.
+        self.assertEqual(result, [
+            {"activity_id": "A-001", "title": "十五号培训一", "on": "2026-10-15", "capacity": 1, "participants": []},
+            {"activity_id": "A-003", "title": "二十号培训", "on": "2026-10-20", "capacity": 3, "participants": ["M-003"]},
+        ])
+        reopened = TeamPlanner(self.root)
+        # Only 小陈 is removed; everyone else keeps their relative order and
+        # titles, dates and capacities are untouched.
+        self.assertEqual(reopened.roster("A-002")["members"], [{"member_id": "M-001", "name": "小陈"}, {"member_id": "M-002", "name": "小林"}])
+        self.assertEqual(reopened.roster("A-003")["members"], [{"member_id": "M-003", "name": "小周"}])
+        self.assertEqual([a["activity_id"] for a in reopened.activities()], ["A-001", "A-002", "A-003"])
+        # The canceled activities leave the schedule and the same-day
+        # conflict on the remaining A-002 is gone.
+        schedule = reopened.member_schedule("M-001")
+        self.assertEqual([r["activity_id"] for r in schedule], ["A-002"])
+        self.assertEqual(schedule[0]["conflict_activity_ids"], [])
+        # The freed seat on the previously full A-001 can be enrolled again.
+        reopened.enroll("A-001", "M-002")
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-001")["members"]], ["M-002"])
+
+    def test_cancel_enrollments_return_order_follows_input(self):
+        self._cancel_ready()
+        result = self.app.cancel_enrollments("M-001", ["A-003", "A-001"])
+        self.assertEqual([a["activity_id"] for a in result], ["A-003", "A-001"])
+
+    def test_cancel_enrollments_own_completion_blocks_whole_call(self):
+        self._cancel_ready()
+        self.app.record_completion("A-001", "M-001", "2026-10-16")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.cancel_enrollments("M-001", ["A-001", "A-002"])
+        # Neither roster changes and the completion record is kept.
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-001"])
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-002")["members"]], ["M-001", "M-002"])
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-001")], ["A-001"])
+
+    def test_cancel_enrollments_rejections_leave_state_unchanged(self):
+        self._cancel_ready()
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            {"member_id": "GHOST", "activity_ids": ["A-001"]},
+            {"member_id": "M-001", "activity_ids": ["GHOST"]},
+            {"member_id": "M-001", "activity_ids": ["A-001", "GHOST"]},
+            {"member_id": "M-002", "activity_ids": ["A-001"]},  # not enrolled
+            {"member_id": "M-001", "activity_ids": ["A-001", "A-002", "A-003", "A-001"]},  # duplicate
+            {"member_id": "M-001", "activity_ids": ["A-001", " A-001 "]},  # duplicate after trim
+            {"member_id": "M-001", "activity_ids": []},
+            {"member_id": "M-001", "activity_ids": "A-001"},
+            {"member_id": "M-001", "activity_ids": None},
+            {"member_id": "M-001", "activity_ids": [7]},
+            {"member_id": "M-001", "activity_ids": ["  "]},
+            {"member_id": "  ", "activity_ids": ["A-001"]},
+            {"member_id": 9, "activity_ids": ["A-001"]},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.cancel_enrollments(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cancel_enrollments_past_activity_and_other_member_completion(self):
+        self._cancel_ready()
+        # A past activity without a completion record can still be withdrawn.
+        self.app.create_activity("A-000", "九月培训", "2026-09-01", 2)
+        self.app.enroll("A-000", "M-001")
+        # 小林's own completion on A-002 does not block 小陈's cancel.
+        self.app.record_completion("A-002", "M-002", "2026-10-16")
+        result = TeamPlanner(self.root).cancel_enrollments("M-001", ["A-000", "A-002"])
+        self.assertEqual([a["participants"] for a in result], [[], ["M-002"]])
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-002")], ["A-002"])
+
+    def test_cancel_enrollments_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        result = TeamPlanner(legacy).cancel_enrollments("M-001", ["A-001"])
+        self.assertEqual(result[0]["participants"], [])
+
+    def test_invalid_cancel_does_not_create_file(self):
+        fresh = TeamPlanner(self.root / "empty")
+        with self.assertRaises(ValueError):
+            fresh.cancel_enrollments("M-001", [])
+        with self.assertRaises(ValueError):
+            fresh.cancel_enrollments("M-001", ["A-001"])
+        self.assertFalse((self.root / "empty").exists())
+
+    def test_cli_cancel_object_array_and_partial_failure(self):
+        self._cancel_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "cancel", name], text=True, capture_output=True)
+        ok = run({"member_id": "M-001", "activity_ids": ["A-001", "A-003"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([a["activity_id"] for a in json.loads(ok.stdout)], ["A-001", "A-003"])
+        bad = run({"member_id": "M-001", "activity_ids": ["A-001"]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        # Array input: the first cancel succeeds and stays saved, the second
+        # fails; stdout stays empty and the batch stops.
+        partial = run([
+            {"member_id": "M-001", "activity_ids": ["A-002"]},
+            {"member_id": "M-001", "activity_ids": ["A-002"]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-002")["members"]], ["M-002"])
+
 if __name__ == "__main__":
     unittest.main()
