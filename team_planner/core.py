@@ -223,6 +223,58 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return {"activity_id": activity_id, "member_id": member_id, "completed_on": completed_on, "title": activity["title"], "on": activity["on"]}
 
+    def record_completions(self, records):
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a nonempty array")
+        entries = []
+        seen = set()
+        # Normalize and check the whole input before reading history: bad
+        # types, shapes or dates must never create a missing directory or file.
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "member_id", "completed_on"}:
+                raise ValueError("each record must contain only activity_id, member_id and completed_on")
+            activity_id = text(item["activity_id"], "activity_id")
+            member_id = text(item["member_id"], "member_id")
+            completed_on = day(item["completed_on"], "completed_on")
+            # The same activity/member pair is rejected even with an identical
+            # date: duplicates are never merged into one record.
+            if (activity_id, member_id) in seen:
+                raise ValueError("records must not contain duplicate activity and member pairs")
+            seen.add((activity_id, member_id))
+            entries.append((activity_id, member_id, completed_on))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        completions = data.get("completions", {})
+        selected = []
+        # Validate every record first: the group takes effect only when each
+        # activity and member exists, the member is enrolled, no own completion
+        # exists for that activity, and the date is on or after the activity.
+        # Other members' completion records never block the registration.
+        for activity_id, member_id, completed_on in entries:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            if member_id not in members:
+                raise ValueError("unknown member")
+            if member_id not in activity.get("participants", []):
+                raise ValueError("member is not enrolled in the activity")
+            if member_id in completions.get(activity_id, {}):
+                raise ValueError("completion already recorded")
+            if date.fromisoformat(completed_on) < date.fromisoformat(activity["on"]):
+                raise ValueError("completed_on must be on or after the activity date")
+            selected.append((activity, member_id, completed_on))
+        # Recording completions neither cancels enrollments nor frees capacity;
+        # participant order, profiles, activity fields and existing records are
+        # left untouched. Records may span activities and members.
+        done = data.setdefault("completions", {})
+        results = []
+        for activity, member_id, completed_on in selected:
+            done.setdefault(activity["activity_id"], {})[member_id] = completed_on
+            results.append({"activity_id": activity["activity_id"], "member_id": member_id, "completed_on": completed_on, "title": activity["title"], "on": activity["on"]})
+        self._write(data)
+        return results
+
     def completions(self, member_id):
         member_id = text(member_id, "member_id")
         data = self._read()

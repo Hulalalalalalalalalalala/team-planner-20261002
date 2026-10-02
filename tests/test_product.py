@@ -125,6 +125,225 @@ class ProductTests(unittest.TestCase):
         unknown = run("completions", {"member_id": "GHOST"})
         self.assertEqual(unknown.returncode, 2)
 
+    def _batch_ready(self):
+        # Two fictional trainings on 2026-10-15: A-001 holds 小陈 and 小林,
+        # A-002 holds 小陈 and 小周. A-003 on the 20th already carries 小陈's
+        # completion, which must not block the new batch.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训一", "2026-10-15", 3)
+        self.app.create_activity("A-002", "十五号培训二", "2026-10-15", 3)
+        self.app.create_activity("A-003", "二十号培训", "2026-10-20", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-001", "M-002")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-002", "M-003")
+        self.app.enroll("A-003", "M-001")
+        self.app.record_completion("A-003", "M-001", "2026-10-20")
+
+    def test_record_completions_two_activities_all_registered_in_input_order(self):
+        self._batch_ready()
+        records = [
+            {"activity_id": " A-002 ", "member_id": " M-003 ", "completed_on": "2026-10-15"},
+            {"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-16"},
+            {"activity_id": "A-002", "member_id": "M-001", "completed_on": "2026-10-15"},
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"},
+        ]
+        result = self.app.record_completions(records)
+        self.assertEqual(result, [
+            {"activity_id": "A-002", "member_id": "M-003", "completed_on": "2026-10-15", "title": "十五号培训二", "on": "2026-10-15"},
+            {"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-16", "title": "十五号培训一", "on": "2026-10-15"},
+            {"activity_id": "A-002", "member_id": "M-001", "completed_on": "2026-10-15", "title": "十五号培训二", "on": "2026-10-15"},
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15", "title": "十五号培训一", "on": "2026-10-15"},
+        ])
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([r["activity_id"] for r in reopened.completions("M-001")], ["A-001", "A-002", "A-003"])
+        self.assertEqual([r["activity_id"] for r in reopened.completions("M-002")], ["A-001"])
+        self.assertEqual([r["activity_id"] for r in reopened.completions("M-003")], ["A-002"])
+        # Completion keeps the enrollment and its order; capacity stays occupied.
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-001")["members"]], ["M-001", "M-002"])
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-001", "M-003"])
+        self.app.add_member("M-004", "小吴")
+        self.app.enroll("A-001", "M-004")
+        with self.assertRaises(ValueError):
+            self.app.enroll("A-001", "M-003")
+
+    def test_record_completions_last_failure_registers_nothing(self):
+        self._batch_ready()
+        before = self.app.path.read_bytes()
+        records = [
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"},
+            {"activity_id": "A-002", "member_id": "M-003", "completed_on": "2026-10-15"},
+            {"activity_id": "A-002", "member_id": "M-001", "completed_on": "2026-10-14"},
+        ]
+        with self.assertRaises(ValueError):
+            self.app.record_completions(records)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # Only the pre-existing A-003 completion remains.
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-001")], ["A-003"])
+        self.assertEqual(self.app.completions("M-002"), [])
+        self.assertEqual(self.app.completions("M-003"), [])
+
+    def test_record_completions_other_members_records_and_existing_data_preserved(self):
+        self._batch_ready()
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        raw["note"] = "imported from the old planner"
+        raw["members"]["M-001"]["team"] = "平台"
+        raw["activities"]["A-001"]["location"] = "一号会议室"
+        self.app.path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        # 小林's own completion for A-001 does not block 小陈's record.
+        result = self.app.record_completions([
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"},
+            {"activity_id": "A-002", "member_id": "M-003", "completed_on": "2026-10-16"},
+        ])
+        self.assertEqual([r["member_id"] for r in result], ["M-001", "M-003"])
+        saved = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["note"], "imported from the old planner")
+        self.assertEqual(saved["members"]["M-001"]["team"], "平台")
+        self.assertEqual(saved["activities"]["A-001"]["location"], "一号会议室")
+        self.assertEqual(saved["activities"]["A-001"]["participants"], ["M-001", "M-002"])
+        self.assertEqual(saved["activities"]["A-002"]["participants"], ["M-001", "M-003"])
+        self.assertEqual(saved["completions"]["A-001"], {"M-002": "2026-10-15", "M-001": "2026-10-15"})
+        self.assertEqual(saved["completions"]["A-003"], {"M-001": "2026-10-20"})
+
+    def test_record_completions_show_in_schedule_and_export(self):
+        self._batch_ready()
+        self.app.record_completions([
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"},
+            {"activity_id": "A-002", "member_id": "M-001", "completed_on": "2026-10-16"},
+        ])
+        rows = {r["activity_id"]: r for r in self.app.member_schedule("M-001", status="completed")}
+        self.assertEqual(set(rows), {"A-001", "A-002", "A-003"})
+        self.assertEqual(rows["A-001"]["completed_on"], "2026-10-15")
+        self.assertEqual(rows["A-002"]["completed_on"], "2026-10-16")
+        self.assertEqual(self.app.member_schedule("M-001", status="pending"), [])
+        exported = self.app.export_schedule(status="completed")
+        self.assertEqual(exported["row_count"], 3)
+        pending = self.app.export_schedule(status="pending")
+        body = pending["csv"].split("\r\n")[1:-1]
+        # 小林's A-001 and 小周's A-002 are still pending; 小陈's rows are gone.
+        self.assertEqual(len(body), 2)
+
+    def test_record_completions_rejections_leave_bytes_unchanged(self):
+        self._batch_ready()
+        before = self.app.path.read_bytes()
+        valid = {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"}
+        for records in [
+            None,
+            [],
+            {},
+            "x",
+            3,
+            [42],
+            [None],
+            ["x"],
+            [{"activity_id": "A-001", "member_id": "M-001"}],
+            [{"activity_id": "A-001", "completed_on": "2026-10-15"}],
+            [{"member_id": "M-001", "completed_on": "2026-10-15"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15", "extra": 1}],
+            [{"activity_id": "   ", "member_id": "M-001", "completed_on": "2026-10-15"}],
+            [{"activity_id": 9, "member_id": "M-001", "completed_on": "2026-10-15"}],
+            [{"activity_id": None, "member_id": "M-001", "completed_on": "2026-10-15"}],
+            [{"activity_id": "A-001", "member_id": "   ", "completed_on": "2026-10-15"}],
+            [{"activity_id": "A-001", "member_id": 7, "completed_on": "2026-10-15"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-02-30"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": " 2026-10-15"}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15 "}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": 10}],
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026/10/15"}],
+            [{"activity_id": "GHOST", "member_id": "M-001", "completed_on": "2026-10-15"}],
+            [{"activity_id": "A-001", "member_id": "GHOST", "completed_on": "2026-10-15"}],
+            # 小周 is not enrolled in A-001.
+            [{"activity_id": "A-001", "member_id": "M-003", "completed_on": "2026-10-15"}],
+            # Completion date before the activity date; the current date is irrelevant.
+            [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-14"}],
+            # 小陈 already has a completion for A-003.
+            [{"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-21"}],
+            # Duplicate activity/member pair after trimming, same date: rejected, not merged.
+            [dict(valid), {"activity_id": " A-001 ", "member_id": " M-001 ", "completed_on": "2026-10-15"}],
+            [dict(valid), {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-16"}],
+        ]:
+            with self.assertRaises(ValueError, msg=records):
+                self.app.record_completions(records)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # One valid success, then a repeat of the same pair within the next call fails atomically.
+        self.app.record_completions([dict(valid)])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.record_completions([
+                {"activity_id": "A-002", "member_id": "M-003", "completed_on": "2026-10-15"},
+                {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-20"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.completions("M-003"), [])
+
+    def test_record_completions_invalid_does_not_create_file(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for records in [
+            [],
+            None,
+            [{"activity_id": "A", "member_id": "B", "completed_on": "nope"}],
+        ]:
+            with self.assertRaises(ValueError):
+                fresh.record_completions(records)
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_record_completions_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        result = TeamPlanner(legacy).record_completions([
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"},
+        ])
+        self.assertEqual(result[0]["completed_on"], "2026-10-15")
+        self.assertEqual([r["activity_id"] for r in TeamPlanner(legacy).completions("M-001")], ["A-001"])
+
+    def test_cli_complete_batch_success_failure_and_partial_array(self):
+        self._batch_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "complete-batch", name], text=True, capture_output=True)
+        ok = run({"records": [
+            {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15"},
+            {"activity_id": "A-002", "member_id": "M-003", "completed_on": "2026-10-15"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        values = json.loads(ok.stdout)
+        self.assertEqual([(r["activity_id"], r["member_id"]) for r in values], [("A-001", "M-001"), ("A-002", "M-003")])
+        bad = run({"records": [
+            {"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-14"},
+        ]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stdout, "")
+        self.assertIn("error", json.loads(bad.stderr))
+        # A non-array records value and a malformed item fail the same way.
+        for payload in [{"records": []}, {"records": [{"activity_id": "A-001"}]}, {}]:
+            failed = run(payload)
+            self.assertEqual(failed.returncode, 2, payload)
+            self.assertEqual(failed.stdout, "")
+            self.assertIn("error", json.loads(failed.stderr))
+        # Top-level array: independent batches. 小林's batch succeeds; the next
+        # batch fails on 小陈's duplicate, so only the earlier success is kept.
+        partial = run([
+            {"records": [{"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-15"}]},
+            {"records": [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-20"}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual([r["member_id"] for r in TeamPlanner(self.root).completions("M-002")], ["M-002"])
+        self.assertEqual([r["completed_on"] for r in TeamPlanner(self.root).completions("M-001") if r["activity_id"] == "A-001"], ["2026-10-15"])
+
     def _transfer_ready(self):
         # A-001 on the 15th is full with 小陈 and 小林; A-002 on the 16th
         # still has free seats and 小周 is already enrolled.
