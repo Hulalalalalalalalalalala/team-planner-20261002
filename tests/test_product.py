@@ -926,6 +926,222 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], ["M-001"])
         self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-002")["members"]], ["M-002"])
 
+    def test_preview_transfer_same_day_full_swap_is_feasible(self):
+        # The headline scenario: two full trainings on 2026-10-15 swap seats;
+        # with no completion record and no third-activity conflict the preview
+        # is feasible. Identifiers are trimmed and entries keep input order.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-001", "十五号甲", "2026-10-15", 1)
+        self.app.create_activity("A-002", "十五号乙", "2026-10-15", 1)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-002")
+        before = self.app.path.read_bytes()
+        result = self.app.preview_transfer_enrollments([
+            {"source_activity_id": " A-001 ", "target_activity_id": "A-002", "member_id": " M-001 "},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002"},
+        ])
+        self.assertEqual(result, {
+            "can_transfer": True,
+            "changes": [
+                {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001", "has_completion": False, "remaining_seats": 0, "conflict_activity_ids": []},
+                {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002", "has_completion": False, "remaining_seats": 0, "conflict_activity_ids": []},
+            ],
+        })
+        # A preview never rewrites the file; the rosters stay as they were.
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-001"])
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-002")["members"]], ["M-002"])
+
+    def test_preview_transfer_reports_completion_overflow_and_conflict_together(self):
+        # One entry carries all three obstacles at once: 小陈's own completion
+        # for the source, a full target that frees no seat (negative remaining
+        # seats), and a completed-capable third activity on the target date.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训", "2026-10-15", 2)
+        self.app.create_activity("A-002", "十六号培训", "2026-10-16", 1)
+        self.app.create_activity("A-003", "十六号另一场", "2026-10-16", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-003")
+        self.app.enroll("A-003", "M-001")
+        self.app.record_completion("A-001", "M-001", "2026-10-15")
+        before = self.app.path.read_bytes()
+        result = self.app.preview_transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+        ])
+        self.assertFalse(result["can_transfer"])
+        self.assertEqual(result["changes"], [
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001",
+             "has_completion": True, "remaining_seats": -1, "conflict_activity_ids": ["A-003"]},
+        ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # Other members' completion records are not reported on this entry.
+        self.app.record_completion("A-002", "M-003", "2026-10-16")
+        result = self.app.preview_transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+        ])
+        self.assertTrue(result["changes"][0]["has_completion"])
+
+    def test_preview_transfer_shared_target_seats_are_consistent(self):
+        # Two movers share one target: every entry naming that target reports
+        # the same final seat count (negative when overflowing), and an entry
+        # whose own source is finished still counts toward the headcount.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.add_member("M-004", "小吴")
+        self.app.create_activity("A-001", "十五号培训", "2026-10-15", 3)
+        self.app.create_activity("A-002", "十六号培训", "2026-10-16", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-001", "M-004")
+        self.app.enroll("A-001", "M-002")
+        self.app.enroll("A-002", "M-003")
+        self.app.record_completion("A-001", "M-001", "2026-10-15")
+        result = self.app.preview_transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-002"},
+        ])
+        self.assertEqual([c["remaining_seats"] for c in result["changes"]], [-1, -1])
+        self.assertEqual([c["has_completion"] for c in result["changes"]], [True, False])
+        self.assertFalse(result["can_transfer"])
+
+    def test_preview_transfer_conflict_ids_sorted_completed_counts(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训", "2026-10-15", 4)
+        self.app.create_activity("A-002", "十六号培训", "2026-10-16", 4)
+        self.app.create_activity("A-003", "十六号一场", "2026-10-16", 4)
+        self.app.create_activity("A-004", "十六号已完成", "2026-10-16", 4)
+        self.app.create_activity("A-005", "十六号他人场", "2026-10-16", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-003", "M-001")
+        self.app.enroll("A-003", "M-003")
+        self.app.enroll("A-004", "M-001")
+        self.app.enroll("A-005", "M-002")
+        self.app.record_completion("A-004", "M-001", "2026-10-16")
+        result = self.app.preview_transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+        ])
+        self.assertFalse(result["can_transfer"])
+        # The completed A-004 still counts, ids are sorted, and A-005 (only
+        # 小林 enrolled) is no conflict for 小陈.
+        self.assertEqual(result["changes"][0]["conflict_activity_ids"], ["A-003", "A-004"])
+        self.assertFalse(result["changes"][0]["has_completion"])
+
+    def test_preview_transfer_unrelated_source_date_conflict_not_listed(self):
+        self._transfer_batch_ready()
+        # 小陈 keeps a seat in another activity on the SOURCE date (the 15th);
+        # it is unrelated to the target date and must not block the swap.
+        self.app.create_activity("A-003", "十五号另一场", "2026-10-15", 2)
+        self.app.enroll("A-003", "M-001")
+        before = self.app.path.read_bytes()
+        result = self.app.preview_transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002"},
+        ])
+        self.assertTrue(result["can_transfer"])
+        self.assertEqual([c["conflict_activity_ids"] for c in result["changes"]], [[], []])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-003")["members"]], ["M-001"])
+
+    def test_preview_transfer_invalid_never_creates_or_rewrites(self):
+        self._transfer_batch_ready()
+        self.app.create_activity("A-003", "十七号培训", "2026-10-17", 2)
+        self.app.enroll("A-003", "M-001")
+        before = self.app.path.read_bytes()
+        for changes in [
+            None,
+            [],
+            {},
+            "x",
+            3,
+            [42],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001", "extra": 1}],
+            [{"source_activity_id": "  ", "target_activity_id": "A-002", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": 7, "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": None}],
+            [{"source_activity_id": "GHOST", "target_activity_id": "A-002", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "GHOST", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "GHOST"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-001", "member_id": "M-001"}],  # same activity
+            [{"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-001"}],  # not in source
+            [{"source_activity_id": "A-001", "target_activity_id": "A-003", "member_id": "M-001"}],  # already in target
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+             {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": " M-001 "}],  # duplicate member
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.preview_transfer_enrollments(changes)
+        self.assertEqual(before, self.app.path.read_bytes())
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for changes in [
+            [],
+            [{"source_activity_id": "A", "target_activity_id": "B", "member_id": "M"}],  # unknown activity
+        ]:
+            with self.assertRaises(ValueError):
+                fresh.preview_transfer_enrollments(changes)
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_preview_transfer_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.add_member("M-002", "小林")
+        other.create_activity("A-001", "旧活动一", "2026-10-15", 1)
+        other.create_activity("A-002", "旧活动二", "2026-10-16", 1)
+        other.enroll("A-001", "M-001")
+        other.enroll("A-002", "M-002")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        before = (legacy / "data.json").read_bytes()
+        result = TeamPlanner(legacy).preview_transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002"},
+        ])
+        self.assertTrue(result["can_transfer"])
+        self.assertTrue(all(not c["has_completion"] for c in result["changes"]))
+        self.assertEqual(before, (legacy / "data.json").read_bytes())
+
+    def test_cli_preview_transfer_success_failure_and_no_writes(self):
+        self._transfer_batch_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "preview-transfer", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"changes": [
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        preview = json.loads(ok.stdout)
+        self.assertTrue(preview["can_transfer"])
+        self.assertEqual([(c["source_activity_id"], c["target_activity_id"], c["member_id"]) for c in preview["changes"]],
+                         [("A-001", "A-002", "M-001"), ("A-002", "A-001", "M-002")])
+        # An unknown activity is an input error: exit 2, error JSON on stderr,
+        # nothing on stdout.
+        bad = run({"changes": [{"source_activity_id": "A-001", "target_activity_id": "GHOST", "member_id": "M-001"}]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # Top-level array: independent previews; a later failure still stops the
+        # command with empty stdout, and nothing is ever written in any case.
+        partial = run([
+            {"changes": [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"}]},
+            {"changes": [{"source_activity_id": "A-001", "target_activity_id": "GHOST", "member_id": "M-001"}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], ["M-001"])
+        self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-002")["members"]], ["M-002"])
+
     def _schedule_ready(self):
         # 小陈 is enrolled in A-001/A-002 on the 15th and A-003 on the 20th;
         # 小林 shares A-001 and alone occupies A-005 on the 20th.
