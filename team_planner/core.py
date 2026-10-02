@@ -40,6 +40,69 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return activity
 
+    def enroll_batch(self, records):
+        # The whole group takes effect at once: every entry is normalized and
+        # checked before any participant list is touched.
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "member_id"}:
+                raise ValueError("each record must contain only activity_id and member_id")
+            activity_id = text(item["activity_id"], "activity_id")
+            member_id = text(item["member_id"], "member_id")
+            # A repeated activity/member pair rejects the whole group; one
+            # member may still join several activities and one activity may
+            # still receive several members.
+            pair = (activity_id, member_id)
+            if pair in seen:
+                raise ValueError("records must not contain duplicate activity and member pairs")
+            seen.add(pair)
+            entries.append((activity_id, member_id))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        for activity_id, member_id in entries:
+            activity = activities.get(activity_id)
+            if activity is None or member_id not in members:
+                raise ValueError("unknown activity or member")
+            if member_id in activity["participants"]:
+                raise ValueError("member already enrolled")
+        # Capacity is judged on the final rosters: the original list plus
+        # every new enrollment of this group. Completed enrollments keep
+        # their seats, so the participants lists already cover them.
+        delta = {}
+        for activity_id, _ in entries:
+            delta[activity_id] = delta.get(activity_id, 0) + 1
+        for activity_id, change in delta.items():
+            activity = activities[activity_id]
+            if len(activity["participants"]) + change > activity["capacity"]:
+                raise ValueError("activity is full")
+        # Same-day conflicts are judged on the final enrollments too: a new
+        # enrollment must not collide with the member's existing enrollments
+        # on that date (completed ones still count) nor with another entry of
+        # this group. Other members' enrollments and historical conflicts on
+        # dates the member is not newly joining never block the group.
+        joining = {}
+        for activity_id, member_id in entries:
+            joining.setdefault(member_id, {}).setdefault(activities[activity_id]["on"], set()).add(activity_id)
+        for activity_id, member_id in entries:
+            on = activities[activity_id]["on"]
+            if len(joining[member_id][on]) > 1:
+                raise ValueError("member is enrolled in another activity on that date")
+            for other_id, other in activities.items():
+                if other_id != activity_id and other.get("on") == on and member_id in other.get("participants", []):
+                    raise ValueError("member is enrolled in another activity on that date")
+        # New members are appended to each roster in input order; everyone
+        # already enrolled keeps their relative position.
+        for activity_id, member_id in entries:
+            activities[activity_id]["participants"].append(member_id)
+        self._write(data)
+        # One full activity object per entry, in input order; an activity
+        # named by several entries reflects the final roster after the group.
+        return [activities[activity_id] for activity_id, _ in entries]
+
     def transfer_enrollment(self, source_activity_id, target_activity_id, member_id):
         source_activity_id = text(source_activity_id, "source_activity_id")
         target_activity_id = text(target_activity_id, "target_activity_id")

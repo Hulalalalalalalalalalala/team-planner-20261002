@@ -1986,5 +1986,227 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(partial.stderr))
         self.assertEqual(partial.stdout, "")
 
+    def _enroll_batch_ready(self):
+        # Fictional fixed dates: on 2026-10-15 A-001 has one free seat (小周
+        # holds the other) and 小陈's finished A-004 still occupies its seat;
+        # A-002 and A-005 run on the 16th, A-003 on the 17th, all with room.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.add_member("M-004", "小吴")
+        self.app.create_activity("A-001", "十五号培训", "2026-10-15", 2)
+        self.app.create_activity("A-002", "十六号培训", "2026-10-16", 2)
+        self.app.create_activity("A-003", "十七号培训", "2026-10-17", 2)
+        self.app.create_activity("A-004", "十五号另一场", "2026-10-15", 2)
+        self.app.create_activity("A-005", "十六号另一场", "2026-10-16", 2)
+        self.app.enroll("A-001", "M-003")
+        self.app.enroll("A-004", "M-001")
+        self.app.record_completion("A-004", "M-001", "2026-10-15")
+
+    def test_enroll_batch_cross_member_and_activity(self):
+        self._enroll_batch_ready()
+        # Identifiers are trimmed; one member may join several activities on
+        # different dates and one activity may receive several members. An
+        # activity named twice shows the final roster in both entries.
+        result = self.app.enroll_batch([
+            {"activity_id": " A-002 ", "member_id": "M-001"},
+            {"activity_id": "A-002", "member_id": " M-002 "},
+            {"activity_id": "A-003", "member_id": "M-001"},
+        ])
+        self.assertEqual(result, [
+            {"activity_id": "A-002", "title": "十六号培训", "on": "2026-10-16", "capacity": 2, "participants": ["M-001", "M-002"]},
+            {"activity_id": "A-002", "title": "十六号培训", "on": "2026-10-16", "capacity": 2, "participants": ["M-001", "M-002"]},
+            {"activity_id": "A-003", "title": "十七号培训", "on": "2026-10-17", "capacity": 2, "participants": ["M-001"]},
+        ])
+        # The new enrollments survive reopening and show up in rosters,
+        # schedules and candidate queries; the completion record is untouched.
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-001", "M-002"])
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-003")["members"]], ["M-001"])
+        self.assertEqual([r["activity_id"] for r in reopened.member_schedule("M-001")], ["A-004", "A-002", "A-003"])
+        self.assertEqual([r["activity_id"] for r in reopened.completions("M-001")], ["A-004"])
+        self.assertEqual([o["activity_id"] for o in reopened.enrollment_options("M-001")], ["A-001", "A-005"])
+        self.assertEqual(reopened.enrollment_options("M-001", available_only=True), [])
+
+    def test_enroll_batch_last_seat_rejects_whole_group(self):
+        self._enroll_batch_ready()
+        # A-001 has exactly one free seat and neither 小林 nor 小吴 has a
+        # same-day engagement: both cannot take it, so nothing is enrolled.
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.enroll_batch([
+                {"activity_id": "A-001", "member_id": "M-002"},
+                {"activity_id": "A-001", "member_id": "M-004"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-003"])
+        # The completed enrollment in A-004 keeps its seat: two additions to
+        # a capacity-2 activity overflow as well.
+        with self.assertRaises(ValueError):
+            self.app.enroll_batch([
+                {"activity_id": "A-004", "member_id": "M-002"},
+                {"activity_id": "A-004", "member_id": "M-004"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # Picking different dates with free seats and no own same-day
+        # conflict succeeds for both.
+        result = self.app.enroll_batch([
+            {"activity_id": "A-002", "member_id": "M-002"},
+            {"activity_id": "A-003", "member_id": "M-004"},
+        ])
+        self.assertEqual([a["participants"] for a in result], [["M-002"], ["M-004"]])
+
+    def test_enroll_batch_same_day_conflicts(self):
+        self._enroll_batch_ready()
+        before = self.app.path.read_bytes()
+        # 小陈's completed A-004 still occupies the 15th: joining A-001 on the
+        # same date conflicts even though one seat is free.
+        with self.assertRaises(ValueError):
+            self.app.enroll_batch([{"activity_id": "A-001", "member_id": "M-001"}])
+        # Two entries of the group on the same date conflict with each other.
+        with self.assertRaises(ValueError):
+            self.app.enroll_batch([
+                {"activity_id": "A-002", "member_id": "M-002"},
+                {"activity_id": "A-005", "member_id": "M-002"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.roster("A-002")["members"], [])
+        # Other members' enrollments are no conflict: 小林 takes the last
+        # seat of A-001 next to 小周.
+        result = self.app.enroll_batch([{"activity_id": "A-001", "member_id": "M-002"}])
+        self.assertEqual(result[0]["participants"], ["M-003", "M-002"])
+
+    def test_enroll_batch_unrelated_historical_conflict_does_not_block(self):
+        self._enroll_batch_ready()
+        # The single enroll still allows same-day enrollments: 小陈 picks up
+        # a second seat on the 15th. That historical conflict sits on a date
+        # the group does not touch, so joining A-002 on the 16th is fine.
+        self.app.enroll("A-001", "M-001")
+        result = self.app.enroll_batch([{"activity_id": "A-002", "member_id": "M-001"}])
+        self.assertEqual(result[0]["participants"], ["M-001"])
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-003", "M-001"])
+
+    def test_enroll_batch_rejections_leave_bytes_unchanged(self):
+        self._enroll_batch_ready()
+        before = self.app.path.read_bytes()
+        for records in [
+            None,
+            [],
+            "x",
+            3,
+            {},
+            [42],
+            [None],
+            [[]],
+            [{"activity_id": "A-002"}],
+            [{"member_id": "M-001"}],
+            [{"activity_id": "A-002", "member_id": "M-001", "extra": 1}],
+            [{"activity_id": "   ", "member_id": "M-001"}],
+            [{"activity_id": 9, "member_id": "M-001"}],
+            [{"activity_id": "A-002", "member_id": None}],
+            [{"activity_id": "A-002", "member_id": "  "}],
+            [{"activity_id": "GHOST", "member_id": "M-001"}],
+            [{"activity_id": "A-002", "member_id": "GHOST"}],
+            [{"activity_id": "A-001", "member_id": "M-003"}],  # already enrolled
+            [{"activity_id": "A-004", "member_id": "M-001"}],  # completed stays enrolled
+            # Duplicate activity/member pair after trimming.
+            [{"activity_id": " A-002 ", "member_id": "M-002"},
+             {"activity_id": "A-002", "member_id": " M-002 "}],
+            # The last entry fails; a valid earlier entry cannot save it.
+            [{"activity_id": "A-002", "member_id": "M-002"},
+             {"activity_id": "A-001", "member_id": "M-003"}],
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.enroll_batch(records)
+            self.assertEqual(before, self.app.path.read_bytes())
+        # Nothing from any rejected group survived.
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-002")["members"]], [])
+        self.assertEqual([m["member_id"] for m in self.app.roster("A-001")["members"]], ["M-003"])
+
+    def test_enroll_batch_invalid_does_not_create_file(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for records in [
+            [],
+            "x",
+            [{"activity_id": "A", "member_id": 9}],
+            [{"activity_id": "A"}],
+        ]:
+            with self.assertRaises(ValueError):
+                fresh.enroll_batch(records)
+        # A well-formed group against a missing history fails the business
+        # rules and must not create the directory or data.json either.
+        with self.assertRaises(ValueError):
+            fresh.enroll_batch([{"activity_id": "A", "member_id": "M"}])
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_enroll_batch_legacy_file_and_extra_fields_preserved(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.add_member("M-002", "小林")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 3)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        raw["note"] = "imported from the old planner"
+        raw["members"]["M-001"]["team"] = "平台"
+        raw["activities"]["A-001"]["location"] = "一号会议室"
+        (legacy / "data.json").write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        result = TeamPlanner(legacy).enroll_batch([{"activity_id": "A-001", "member_id": "M-002"}])
+        self.assertEqual(result[0]["participants"], ["M-001", "M-002"])
+        saved = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["note"], "imported from the old planner")
+        self.assertEqual(saved["members"]["M-001"]["team"], "平台")
+        self.assertEqual(saved["activities"]["A-001"]["location"], "一号会议室")
+        self.assertEqual(saved["activities"]["A-001"]["participants"], ["M-001", "M-002"])
+        self.assertNotIn("completions", saved)
+
+    def test_enroll_batch_broken_history_is_rejected(self):
+        self._enroll_batch_ready()
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        raw["activities"]["A-002"]["capacity"] = 0
+        self.app.path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.enroll_batch([{"activity_id": "A-003", "member_id": "M-002"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_enroll_batch_success_failure_and_partial_array(self):
+        self._enroll_batch_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "enroll-batch", name], text=True, capture_output=True)
+        ok = run({"records": [
+            {"activity_id": " A-002 ", "member_id": "M-001"},
+            {"activity_id": "A-002", "member_id": " M-002 "},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([a["participants"] for a in json.loads(ok.stdout)], [["M-001", "M-002"], ["M-001", "M-002"]])
+        # 小陈 is already enrolled in A-002: the call fails with error JSON.
+        bad = run({"records": [{"activity_id": "A-002", "member_id": "M-001"}]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        bad_shape = run({"records": []})
+        self.assertEqual(bad_shape.returncode, 2)
+        self.assertIn("error", json.loads(bad_shape.stderr))
+        # Top-level array: independent batches; the first success (小陈 joins
+        # A-003) stays after the later failure, stdout stays empty and the
+        # error goes to stderr.
+        partial = run([
+            {"records": [{"activity_id": "A-003", "member_id": "M-001"}]},
+            {"records": [{"activity_id": "A-003", "member_id": "M-001"}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-003")["members"]], ["M-001"])
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-001", "M-002"])
+
 if __name__ == "__main__":
     unittest.main()
