@@ -75,6 +75,84 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return target
 
+    def transfer_enrollments(self, changes):
+        # The whole group takes effect at once: every entry is normalized and
+        # checked against the final rosters before any participant is moved.
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("changes must be a nonempty array")
+        entries = []
+        seen_members = set()
+        for item in changes:
+            if not isinstance(item, dict) or set(item) != {"source_activity_id", "target_activity_id", "member_id"}:
+                raise ValueError("each change must contain only source_activity_id, target_activity_id and member_id")
+            source_activity_id = text(item["source_activity_id"], "source_activity_id")
+            target_activity_id = text(item["target_activity_id"], "target_activity_id")
+            member_id = text(item["member_id"], "member_id")
+            # A member can only move once in the group, so swaps and cycles are
+            # expressed with one entry per member, never two entries per head.
+            if member_id in seen_members:
+                raise ValueError("changes must not contain duplicate member ids")
+            seen_members.add(member_id)
+            entries.append((source_activity_id, target_activity_id, member_id))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        completions = data.get("completions", {})
+        # Validate every change against the stored rosters first. Other
+        # members' completion records never block a move, and the member's own
+        # target seat cannot exist yet even when another entry in this group
+        # moves a different member into the same target.
+        for source_activity_id, target_activity_id, member_id in entries:
+            source = activities.get(source_activity_id)
+            target = activities.get(target_activity_id)
+            if source is None or target is None or member_id not in members:
+                raise ValueError("unknown activity or member")
+            if source_activity_id == target_activity_id:
+                raise ValueError("source and target activities must differ")
+            if member_id not in source.get("participants", []):
+                raise ValueError("member is not enrolled in the source activity")
+            if member_id in target.get("participants", []):
+                raise ValueError("member is already enrolled in the target activity")
+            if member_id in completions.get(source_activity_id, {}):
+                raise ValueError("member has a completion record for the source activity")
+        # Final rosters: members not moved out keep their relative order and
+        # incoming members are appended in input order. Capacity and same-day
+        # conflicts are judged on these lists, so two full activities can swap
+        # seats and a full target accepts a transfer that ends within capacity.
+        outgoing = {}
+        affected = set()
+        for source_activity_id, target_activity_id, member_id in entries:
+            affected.add(source_activity_id)
+            affected.add(target_activity_id)
+            outgoing.setdefault(source_activity_id, set()).add(member_id)
+        finals = {
+            activity_id: [member_id for member_id in activities[activity_id].get("participants", []) if member_id not in outgoing.get(activity_id, ())]
+            for activity_id in affected
+        }
+        for _, target_activity_id, member_id in entries:
+            finals[target_activity_id].append(member_id)
+        for activity_id in affected:
+            if len(finals[activity_id]) > activities[activity_id]["capacity"]:
+                raise ValueError("target activity would exceed its capacity")
+        # Each incoming member must not keep a seat in another activity on the
+        # target date in the final rosters. A completed enrollment still holds
+        # its seat; the left source seats are already absent from finals, so
+        # only genuinely retained enrollments on other activities conflict.
+        for _, target_activity_id, member_id in entries:
+            on = activities[target_activity_id]["on"]
+            for other_id, other in activities.items():
+                if other_id == target_activity_id:
+                    continue
+                roster = finals.get(other_id, other.get("participants", []))
+                if other.get("on") == on and member_id in roster:
+                    raise ValueError("member is enrolled in another activity on the target date")
+        for activity_id in affected:
+            activities[activity_id]["participants"] = finals[activity_id]
+        self._write(data)
+        # One target object per input entry, in input order. Repeated targets
+        # return the same final roster each time.
+        return [activities[target_activity_id] for _, target_activity_id, _ in entries]
+
     def cancel_enrollments(self, member_id, activity_ids):
         member_id = text(member_id, "member_id")
         if not isinstance(activity_ids, list) or not activity_ids:

@@ -450,6 +450,238 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], ["M-004"])
         self.assertEqual(TeamPlanner(self.root).roster("A-002")["members"][-1], {"member_id": "M-002", "name": "小林"})
 
+    def _transfer_batch_swap_ready(self):
+        # 2026-10-15: 小陈 alone fills A-001; 2026-10-16: 小林 alone fills
+        # A-002. Each one-person activity is full before the swap.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "十五号培训", "2026-10-15", 1)
+        self.app.create_activity("A-002", "十六号培训", "2026-10-16", 1)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-002")
+
+    def test_transfer_batch_swap_between_full_activities(self):
+        self._transfer_batch_swap_ready()
+        result = self.app.transfer_enrollments([
+            {"source_activity_id": " A-001 ", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": " M-002 "},
+        ])
+        self.assertEqual(result, [
+            {"activity_id": "A-002", "title": "十六号培训", "on": "2026-10-16", "capacity": 1, "participants": ["M-001"]},
+            {"activity_id": "A-001", "title": "十五号培训", "on": "2026-10-15", "capacity": 1, "participants": ["M-002"]},
+        ])
+        # The swap survives reopening and moves the schedules with it.
+        reopened = TeamPlanner(self.root)
+        self.assertEqual(reopened.roster("A-001")["members"], [{"member_id": "M-002", "name": "小林"}])
+        self.assertEqual(reopened.roster("A-002")["members"], [{"member_id": "M-001", "name": "小陈"}])
+        self.assertEqual([r["activity_id"] for r in reopened.member_schedule("M-001")], ["A-002"])
+        self.assertEqual(reopened.export_schedule()["row_count"], 2)
+
+    def test_transfer_batch_cycle_one_seat_each(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        for activity_id, on, member_id in [
+            ("A-001", "2026-10-15", "M-001"),
+            ("A-002", "2026-10-16", "M-002"),
+            ("A-003", "2026-10-17", "M-003"),
+        ]:
+            self.app.create_activity(activity_id, activity_id, on, 1)
+            self.app.enroll(activity_id, member_id)
+        result = self.app.transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-003", "member_id": "M-002"},
+            {"source_activity_id": "A-003", "target_activity_id": "A-001", "member_id": "M-003"},
+        ])
+        self.assertEqual([a["participants"] for a in result], [["M-001"], ["M-002"], ["M-003"]])
+
+    def test_transfer_batch_keeps_stayer_order_appends_in_input_order(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.add_member("M-004", "小吴")
+        self.app.add_member("M-005", "小郑")
+        self.app.create_activity("S1", "原活动一", "2026-10-15", 5)
+        self.app.create_activity("S2", "原活动二", "2026-10-15", 5)
+        self.app.create_activity("T", "目标活动", "2026-10-16", 5)
+        for member_id in ("M-001", "M-002", "M-003"):
+            self.app.enroll("S1", member_id)
+        for member_id in ("M-004", "M-005"):
+            self.app.enroll("S2", member_id)
+        # 小林 already holds a target seat and is not moved: the seat stays first.
+        self.app.enroll("T", "M-002")
+        result = self.app.transfer_enrollments([
+            {"source_activity_id": "S1", "target_activity_id": "T", "member_id": "M-001"},
+            {"source_activity_id": "S2", "target_activity_id": "T", "member_id": "M-004"},
+            {"source_activity_id": "S2", "target_activity_id": "T", "member_id": "M-005"},
+        ])
+        final = ["M-002", "M-001", "M-004", "M-005"]
+        self.assertEqual([a["participants"] for a in result], [final, final, final])
+        self.assertEqual([m["member_id"] for m in self.app.roster("S1")["members"]], ["M-002", "M-003"])
+        self.assertEqual(self.app.roster("S2")["members"], [])
+
+    def test_transfer_batch_capacity_judged_on_final_rosters(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("S", "原活动", "2026-10-15", 2)
+        self.app.create_activity("T", "满员目标", "2026-10-16", 1)
+        self.app.enroll("S", "M-002")
+        self.app.enroll("S", "M-003")
+        self.app.enroll("T", "M-001")
+        before = self.app.path.read_bytes()
+        # Two enter T while only one leaves: the final roster exceeds capacity.
+        with self.assertRaises(ValueError):
+            self.app.transfer_enrollments([
+                {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-002"},
+                {"source_activity_id": "T", "target_activity_id": "S", "member_id": "M-001"},
+                {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-003"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # One leaves and one enters: the originally full target accepts the move.
+        result = self.app.transfer_enrollments([
+            {"source_activity_id": "T", "target_activity_id": "S", "member_id": "M-001"},
+            {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-002"},
+        ])
+        self.assertEqual(result[0]["participants"], ["M-003", "M-001"])
+        self.assertEqual(result[1]["participants"], ["M-002"])
+
+    def test_transfer_batch_completion_and_conflict_rules(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("S", "原活动", "2026-10-15", 3)
+        self.app.create_activity("T", "目标活动", "2026-10-16", 3)
+        self.app.create_activity("O", "同日另一场", "2026-10-16", 3)
+        self.app.enroll("S", "M-001")
+        self.app.enroll("S", "M-002")
+        # A completed third enrollment on the target date still blocks the move.
+        self.app.enroll("O", "M-002")
+        self.app.record_completion("O", "M-002", "2026-10-16")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.transfer_enrollments([
+                {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-001"},
+                {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-002"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 小林's own completion on the source rejects the whole group; 小陈's
+        # move, which would otherwise succeed, is not written either.
+        self.app.create_activity("D", "已完成原活动", "2026-10-15", 3)
+        self.app.enroll("D", "M-002")
+        self.app.record_completion("D", "M-002", "2026-10-15")
+        before_d = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.transfer_enrollments([
+                {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-001"},
+                {"source_activity_id": "D", "target_activity_id": "T", "member_id": "M-002"},
+            ])
+        self.assertEqual(before_d, self.app.path.read_bytes())
+        # Other members' completion records never block: 小陈 moves to T and the
+        # completion records stay where they are (never migrated), ordered by
+        # completed_on in the completions view.
+        result = self.app.transfer_enrollments([
+            {"source_activity_id": "S", "target_activity_id": "T", "member_id": "M-001"},
+        ])
+        self.assertEqual(result[0]["participants"], ["M-001"])
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-002")], ["D", "O"])
+        self.assertEqual([m["member_id"] for m in self.app.roster("S")["members"]], ["M-002"])
+
+    def test_transfer_batch_rejections_leave_bytes_unchanged(self):
+        self._transfer_batch_swap_ready()
+        before = self.app.path.read_bytes()
+        for changes in [
+            None,
+            [],
+            {},
+            "x",
+            3,
+            [42],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002"}],
+            [{"source_activity_id": "A-001", "member_id": "M-001"}],
+            [{"target_activity_id": "A-002", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001", "extra": 1}],
+            [{"source_activity_id": "   ", "target_activity_id": "A-002", "member_id": "M-001"}],
+            [{"source_activity_id": 9, "target_activity_id": "A-002", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": None}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-001", "member_id": "M-001"}],
+            [{"source_activity_id": "GHOST", "target_activity_id": "A-002", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "GHOST", "member_id": "M-001"}],
+            [{"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "GHOST"}],
+            # The same member may only appear once in the group (after trimming).
+            [{"source_activity_id": " A-001 ", "target_activity_id": "A-002", "member_id": "M-001"},
+             {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": " M-001 "}],
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.transfer_enrollments(changes)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_transfer_batch_invalid_does_not_create_file(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for changes in [
+            [],
+            [{"source_activity_id": "A", "target_activity_id": "B", "member_id": "C"}],
+        ]:
+            with self.assertRaises(ValueError):
+                fresh.transfer_enrollments(changes)
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_transfer_batch_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.add_member("M-002", "小林")
+        other.create_activity("A-001", "旧活动一", "2026-10-15", 1)
+        other.create_activity("A-002", "旧活动二", "2026-10-16", 1)
+        other.enroll("A-001", "M-001")
+        other.enroll("A-002", "M-002")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        result = TeamPlanner(legacy).transfer_enrollments([
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002"},
+        ])
+        self.assertEqual([a["participants"] for a in result], [["M-001"], ["M-002"]])
+
+    def test_cli_transfer_batch_success_failure_and_partial_array(self):
+        self._transfer_batch_swap_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "transfer-batch", name], text=True, capture_output=True)
+        ok = run({"changes": [
+            {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-001"},
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-002"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([a["participants"] for a in json.loads(ok.stdout)], [["M-001"], ["M-002"]])
+        bad = run({"changes": [
+            {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-001"},
+        ]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # Top-level array: independent batches. The first batch swaps the seats
+        # back; the later, unknown-activity batch fails but the success stays.
+        partial = run([
+            {"changes": [
+                {"source_activity_id": "A-001", "target_activity_id": "A-002", "member_id": "M-002"},
+                {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-001"},
+            ]},
+            {"changes": [
+                {"source_activity_id": "GHOST", "target_activity_id": "A-002", "member_id": "M-002"},
+            ]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-001")["members"]], ["M-001"])
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-002"])
+
     def _schedule_ready(self):
         # 小陈 is enrolled in A-001/A-002 on the 15th and A-003 on the 20th;
         # 小林 shares A-001 and alone occupies A-005 on the 20th.
