@@ -265,6 +265,66 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return selected
 
+    def preview_reschedule_activities(self, changes):
+        # Read-only twin of reschedule_activities: identical normalization and
+        # validation, but nothing is written — the result only reports what
+        # would block the group.
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("changes must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in changes:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "on"}:
+                raise ValueError("each change must contain only activity_id and on")
+            activity_id = text(item["activity_id"], "activity_id")
+            on = day(item["on"], "on")
+            if activity_id in seen:
+                raise ValueError("changes must not contain duplicate activity ids")
+            seen.add(activity_id)
+            entries.append((activity_id, on))
+        data = self._read()
+        activities = data.get("activities", {})
+        selected = []
+        for activity_id, on in entries:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            selected.append(activity)
+        completions = data.get("completions", {})
+        # Conflicts are judged against every activity's date AFTER the whole
+        # group moves; activities outside the group keep their stored date.
+        final_on = {activity_id: on for activity_id, on in entries}
+        results = []
+        can_reschedule = True
+        for activity, (activity_id, on) in zip(selected, entries):
+            previous_on = activity["on"]
+            completion_member_ids = []
+            conflicts = []
+            # Only activities whose date actually moves are checked; entries
+            # keeping their date report no blockers at all.
+            if on != previous_on:
+                completion_member_ids = sorted(completions.get(activity_id, {}))
+                participants = activity.get("participants", [])
+                per_member = {}
+                for other_id, other in activities.items():
+                    if other_id == activity_id:
+                        continue
+                    if final_on.get(other_id, other.get("on")) != on:
+                        continue
+                    # Completion keeps the enrollment, so participants lists
+                    # already include members who finished the training; an
+                    # activity in which only other members are enrolled is no
+                    # conflict.
+                    others = set(other.get("participants", []))
+                    for member_id in participants:
+                        if member_id in others:
+                            per_member.setdefault(member_id, set()).add(other_id)
+                conflicts = [{"member_id": member_id, "activity_ids": sorted(ids)} for member_id, ids in sorted(per_member.items())]
+            if completion_member_ids or conflicts:
+                can_reschedule = False
+            results.append({"activity_id": activity_id, "previous_on": previous_on, "on": on, "completion_member_ids": completion_member_ids, "conflicts": conflicts})
+        return {"can_reschedule": can_reschedule, "activities": results}
+
     def roster(self, activity_id):
         data = self._read()
         activity = data.get("activities", {}).get(activity_id)
