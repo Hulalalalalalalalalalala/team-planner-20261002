@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import TeamPlanner
 
-ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'cancel': 'cancel_enrollments', 'transfer': 'transfer_enrollment', 'reschedule': 'reschedule_activity', 'reschedule-batch': 'reschedule_activities', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'completions': 'completions', 'merge': 'merge_member', 'schedule': 'member_schedule', 'export-schedule': 'export_schedule'}
+ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'cancel': 'cancel_enrollments', 'transfer': 'transfer_enrollment', 'reschedule': 'reschedule_activity', 'reschedule-batch': 'reschedule_activities', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'complete-batch': 'record_completions', 'completions': 'completions', 'merge': 'merge_member', 'schedule': 'member_schedule', 'export-schedule': 'export_schedule'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))
@@ -51,6 +51,36 @@ def demo(app):
         raise ValueError("demo: the completed activity roster must stay unchanged")
     if [r["activity_id"] for r in app.completions("M-001")] != ["A-003"]:
         raise ValueError("demo: completion records must be kept")
+    # 整组完成登记：2026-10-15 当天两场虚构培训（小陈的 A-001、小周的 A-002）
+    # 一次性提交，允许跨活动、跨成员，标识带首尾空白会先去除；返回顺序与输入
+    # 一致，字段与单条 complete 相同，两场都应登记成功。
+    recorded = app.record_completions([
+        {"activity_id": " A-001 ", "member_id": "M-001", "completed_on": "2026-10-15"},
+        {"activity_id": "A-002", "member_id": " M-003 ", "completed_on": "2026-10-15"},
+    ])
+    if [r["activity_id"] for r in recorded] != ["A-001", "A-002"]:
+        raise ValueError("demo: batch records must follow the input order")
+    if recorded[0] != {"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-15", "title": "新成员产品介绍", "on": "2026-10-15"}:
+        raise ValueError("demo: batch record fields must match the single complete result")
+    # 末条失败（小陈在 A-003 已有完成记录）时整组拒绝：首条小林在 A-002 的
+    # 新记录也不得写入，数据文件字节不变。
+    before = app.path.read_bytes()
+    try:
+        app.record_completions([
+            {"activity_id": "A-002", "member_id": "M-002", "completed_on": "2026-10-15"},
+            {"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-15"},
+        ])
+    except ValueError:
+        pass
+    else:
+        raise ValueError("demo: a batch with a failing last record must be rejected")
+    if before != app.path.read_bytes():
+        raise ValueError("demo: a rejected batch must leave data.json bytes unchanged")
+    if app.completions("M-002") != []:
+        raise ValueError("demo: no record from the rejected batch may survive")
+    # 完成登记不取消报名：两场新完成的培训仍然占位、名单顺序不变。
+    if [m["member_id"] for m in app.roster("A-001")["members"]] != ["M-001"]:
+        raise ValueError("demo: completion keeps the enrollment")
     return app.roster("A-001")
 
 def main(argv=None):

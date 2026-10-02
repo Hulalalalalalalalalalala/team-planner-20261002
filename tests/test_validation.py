@@ -171,6 +171,28 @@ class ValidationTests(unittest.TestCase):
                     query()
             self.assertEqual(self.app.path.read_bytes(), before, index)
 
+    def test_batch_completion_also_rejects_broken_history(self):
+        # The batch entry runs the same whole-history validation: a valid group
+        # against a broken document fails with ValueError and leaves the bytes.
+        good_records = [{"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-15"}]
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.record_completions(good_records)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken group (duplicate pair) fails argument validation before the
+        # filesystem is even touched, so the valid history stays byte-identical.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.record_completions([
+                {"activity_id": "A-002", "member_id": "M-001", "completed_on": "2026-10-15"},
+                {"activity_id": " A-002 ", "member_id": " M-001 ", "completed_on": "2026-10-15"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
     def test_unrelated_broken_record_is_not_hidden_by_filters(self):
         # Querying M-001's own data must still fail because of M-002's broken
         # profile and A-002's broken completion record.
