@@ -777,5 +777,143 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(TeamPlanner(self.root).roster("A-001")["on"], "2026-10-17")
         self.assertEqual(TeamPlanner(self.root).roster("A-002")["on"], "2026-10-15")
 
+    def test_export_schedule_rows_sorted_with_conflicts(self):
+        self._schedule_ready()
+        result = self.app.export_schedule()
+        self.assertEqual(result["row_count"], 5)
+        lines = result["csv"].split("\r\n")
+        self.assertEqual(lines[0], "member_id,name,activity_id,title,on,status,completed_on,conflict_activity_ids")
+        self.assertEqual(lines[-1], "")
+        rows = lines[1:-1]
+        self.assertEqual(len(rows), 5)
+        # Sorted by on, activity_id, member_id; the completed enrollment stays.
+        self.assertEqual(rows[0], 'M-001,小陈,A-001,十五号培训一,2026-10-15,completed,2026-10-16,"[""A-002""]"')
+        self.assertEqual(rows[1], 'M-002,小林,A-001,十五号培训一,2026-10-15,pending,,[]')
+        self.assertEqual(rows[2], 'M-001,小陈,A-002,十五号培训二,2026-10-15,pending,,"[""A-001""]"')
+        self.assertEqual(rows[3], 'M-001,小陈,A-003,二十号培训,2026-10-20,pending,,[]')
+        # A-005 has only 小林, so 小陈's A-003 has no conflict and vice versa.
+        self.assertEqual(rows[4], 'M-002,小林,A-005,二十号他人培训,2026-10-20,pending,,[]')
+        # CRLF everywhere, no BOM, no lone LF.
+        self.assertNotIn("\n", result["csv"].replace("\r\n", ""))
+        self.assertFalse(result["csv"].startswith("﻿"))
+
+    def test_export_schedule_filters_and_conflicts_ignore_status(self):
+        self._schedule_ready()
+        pending = self.app.export_schedule(status="pending")
+        self.assertEqual(pending["row_count"], 4)
+        rows = pending["csv"].split("\r\n")[1:-1]
+        self.assertNotIn("completed", ",".join(r.split(",")[5] for r in rows))
+        # The completed A-001 is hidden but still conflicts with 小陈's A-002.
+        self.assertIn('"[""A-001""]"', rows[1])
+        completed = self.app.export_schedule(status="completed")
+        self.assertEqual(completed["row_count"], 1)
+        self.assertIn('"[""A-002""]"', completed["csv"])
+        # Inclusive date range on the activity date.
+        self.assertEqual(self.app.export_schedule(from_on="2026-10-15", to_on="2026-10-15")["row_count"], 3)
+        self.assertEqual(self.app.export_schedule(from_on="2026-10-16")["row_count"], 2)
+        self.assertEqual(self.app.export_schedule(to_on="2026-10-14")["row_count"], 0)
+        empty = self.app.export_schedule(from_on="2026-11-01")
+        self.assertEqual(empty["row_count"], 0)
+        self.assertEqual(empty["csv"], "member_id,name,activity_id,title,on,status,completed_on,conflict_activity_ids\r\n")
+
+    def test_export_schedule_quoting_and_cancellation(self):
+        self.app.add_member("M-001", '小"陈')
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-001", "含,逗号", "2026-10-15", 4)
+        self.app.create_activity("A-002", "含\n换行", "2026-10-15", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-001", "M-002")
+        result = self.app.export_schedule()
+        rows = result["csv"].split("\r\n")[1:-1]
+        self.assertEqual(rows[0], 'M-001,"小""陈",A-001,"含,逗号",2026-10-15,pending,,"[""A-002""]"')
+        self.assertEqual(rows[1], 'M-002,小林,A-001,"含,逗号",2026-10-15,pending,,[]')
+        self.assertEqual(rows[2], 'M-001,"小""陈",A-002,"含\n换行",2026-10-15,pending,,"[""A-001""]"')
+        # A canceled enrollment leaves no row; an activity without
+        # participants and a member without enrollments produce none either.
+        self.app.cancel_enrollments("M-002", ["A-001"])
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-003", "无人报名", "2026-10-16", 2)
+        result = self.app.export_schedule()
+        self.assertEqual(result["row_count"], 2)
+        self.assertNotIn("M-002", result["csv"])
+        self.assertNotIn("M-003", result["csv"])
+        self.assertNotIn("A-003", result["csv"])
+
+    def test_export_schedule_rejections_never_modify_state(self):
+        self._schedule_ready()
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            {"from_on": 10},
+            {"to_on": "2026-02-30"},
+            {"from_on": " 2026-10-15"},
+            {"from_on": "2026/10/15"},
+            {"from_on": "2026-13-01"},
+            {"from_on": "2026-10-20", "to_on": "2026-10-15"},
+            {"status": "done"},
+            {"status": None},
+            {"status": "PENDING"},
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.export_schedule(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # A successful export does not rewrite the file either.
+        self.app.export_schedule(from_on="2026-10-01", to_on="2026-12-31", status="all")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_export_schedule_does_not_create_file_and_legacy_pending(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        result = fresh.export_schedule()
+        self.assertEqual(result["row_count"], 0)
+        self.assertEqual(result["csv"], "member_id,name,activity_id,title,on,status,completed_on,conflict_activity_ids\r\n")
+        self.assertFalse(empty.exists())
+        with self.assertRaises(ValueError):
+            fresh.export_schedule(status="done")
+        self.assertFalse(empty.exists())
+        # A historical data.json without a completions field exports as pending.
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        row = TeamPlanner(legacy).export_schedule()["csv"].split("\r\n")[1]
+        self.assertEqual(row, "M-001,小陈,A-001,旧活动,2026-10-15,pending,,[]")
+
+    def test_export_schedule_broken_history_is_rejected(self):
+        self._schedule_ready()
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        raw["activities"]["A-001"]["capacity"] = 0
+        self.app.path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.export_schedule(to_on="2026-10-20")
+
+    def test_cli_export_schedule_object_array_and_failure(self):
+        self._schedule_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "export-schedule", name], text=True, capture_output=True)
+        ok = run({"status": "pending"})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["row_count"], 4)
+        self.assertTrue(value["csv"].startswith("member_id,name,activity_id,title,on,status,completed_on,conflict_activity_ids\r\n"))
+        batch = run([{"from_on": "2026-10-15", "to_on": "2026-10-15"}, {}])
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        values = json.loads(batch.stdout)
+        self.assertEqual([v["row_count"] for v in values], [3, 5])
+        bad = run({"status": "done"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([{}, {"from_on": "2026-10-20", "to_on": "2026-10-15"}])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+
 if __name__ == "__main__":
     unittest.main()

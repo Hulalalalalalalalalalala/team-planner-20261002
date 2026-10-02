@@ -1,4 +1,7 @@
+import csv
 from datetime import date
+import io
+import json
 from .storage import JsonStore, text, positive, day
 
 class TeamPlanner(JsonStore):
@@ -326,3 +329,58 @@ class TeamPlanner(JsonStore):
                 "conflict_activity_ids": sorted(aid for aid in enrolled_on.get(on, ()) if aid != activity_id),
             })
         return sorted(records, key=lambda r: (r["on"], r["activity_id"]))
+
+    def export_schedule(self, from_on=None, to_on=None, status="all"):
+        if from_on is not None:
+            from_on = day(from_on, "from_on")
+        if to_on is not None:
+            to_on = day(to_on, "to_on")
+        if from_on is not None and to_on is not None and from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        if status not in ("all", "pending", "completed"):
+            raise ValueError("status must be one of all, pending, completed")
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Conflicts come from each member's full current enrollment, ignoring
+        # the date range and status filters, exactly like member_schedule:
+        # a completed or filtered-out enrollment still counts, other members'
+        # enrollments never do.
+        enrolled_on = {}
+        for activity_id, activity in activities.items():
+            for member_id in activity.get("participants", []):
+                enrolled_on.setdefault(member_id, {}).setdefault(activity.get("on"), set()).add(activity_id)
+        rows = []
+        for activity_id, activity in activities.items():
+            on = activity["on"]
+            if from_on is not None and on < from_on:
+                continue
+            if to_on is not None and on > to_on:
+                continue
+            done = completions.get(activity_id, {})
+            for member_id in activity.get("participants", []):
+                completed_on = done.get(member_id)
+                current = "completed" if completed_on is not None else "pending"
+                if status != "all" and current != status:
+                    continue
+                conflicts = sorted(aid for aid in enrolled_on[member_id].get(on, ()) if aid != activity_id)
+                rows.append([
+                    member_id,
+                    members[member_id]["name"],
+                    activity_id,
+                    activity["title"],
+                    on,
+                    current,
+                    completed_on if completed_on is not None else "",
+                    json.dumps(conflicts, ensure_ascii=False, separators=(",", ":")),
+                ])
+        rows.sort(key=lambda row: (row[4], row[2], row[0]))
+        buffer = io.StringIO()
+        # QUOTE_MINIMAL quotes exactly the cells containing a comma, a double
+        # quote or a newline; inner quotes are doubled. CRLF line endings, no
+        # BOM, so Chinese text and embedded newlines survive untouched.
+        writer = csv.writer(buffer, lineterminator="\r\n")
+        writer.writerow(["member_id", "name", "activity_id", "title", "on", "status", "completed_on", "conflict_activity_ids"])
+        writer.writerows(rows)
+        return {"csv": buffer.getvalue(), "row_count": len(rows)}
