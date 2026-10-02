@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import TeamPlanner
 
-ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'cancel': 'cancel_enrollments', 'transfer': 'transfer_enrollment', 'transfer-batch': 'transfer_enrollments', 'preview-transfer': 'preview_transfer_enrollments', 'reschedule': 'reschedule_activity', 'reschedule-batch': 'reschedule_activities', 'preview-reschedule': 'preview_reschedule_activities', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'complete-batch': 'record_completions', 'correct-completions': 'correct_completions', 'completions': 'completions', 'merge': 'merge_member', 'schedule': 'member_schedule', 'enrollment-options': 'enrollment_options', 'export-schedule': 'export_schedule'}
+ACTIONS = {'member': 'add_member', 'activity': 'create_activity', 'enroll': 'enroll', 'cancel': 'cancel_enrollments', 'transfer': 'transfer_enrollment', 'transfer-batch': 'transfer_enrollments', 'preview-transfer': 'preview_transfer_enrollments', 'reschedule': 'reschedule_activity', 'reschedule-batch': 'reschedule_activities', 'preview-reschedule': 'preview_reschedule_activities', 'roster': 'roster', 'list': 'activities', 'complete': 'record_completion', 'complete-batch': 'record_completions', 'correct-completions': 'correct_completions', 'completions': 'completions', 'training-progress': 'training_progress', 'merge': 'merge_member', 'schedule': 'member_schedule', 'enrollment-options': 'enrollment_options', 'export-schedule': 'export_schedule'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))

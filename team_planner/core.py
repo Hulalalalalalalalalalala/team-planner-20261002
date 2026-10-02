@@ -582,6 +582,91 @@ class TeamPlanner(JsonStore):
             records.append({"activity_id": activity_id, "member_id": member_id, "completed_on": members[member_id], "title": activity["title"], "on": activity["on"]})
         return sorted(records, key=lambda r: (r["completed_on"], r["on"], r["activity_id"]))
 
+    def training_progress(self, activity_ids, as_of, member_ids=None):
+        # Multi-member check against one cutoff: arguments are normalized and
+        # checked before the history is read.
+        if not isinstance(activity_ids, list) or not activity_ids:
+            raise ValueError("activity_ids must be a nonempty array")
+        selected_ids = []
+        seen = set()
+        for activity_id in activity_ids:
+            activity_id = text(activity_id, "activity_id")
+            if activity_id in seen:
+                raise ValueError("activity_ids must not contain duplicates")
+            seen.add(activity_id)
+            selected_ids.append(activity_id)
+        as_of = day(as_of, "as_of")
+        # member_ids omitted or null means every member; an empty array means
+        # nobody at all. Any other type is rejected.
+        if member_ids is None:
+            requested_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            requested_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                requested_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Selected activities keep the input order; every id must exist even
+        # when no members are requested.
+        selected = []
+        for activity_id in selected_ids:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            selected.append(activity)
+        if requested_ids is None:
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in requested_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = requested_ids
+        cutoff = date.fromisoformat(as_of)
+        result_members = []
+        for member_id in ordered_member_ids:
+            trainings = []
+            completed_count = 0
+            # Only the member's own current enrollment and own completion
+            # record matter; other members never affect the status, and the
+            # cutoff applies to the completion date alone.
+            for activity_id, activity in zip(selected_ids, selected):
+                enrolled = member_id in activity.get("participants", [])
+                completed_on = completions.get(activity_id, {}).get(member_id)
+                if not enrolled:
+                    status = "not_enrolled"
+                elif completed_on is not None and date.fromisoformat(completed_on) <= cutoff:
+                    status = "completed"
+                    completed_count += 1
+                else:
+                    # Enrolled without a record, or whose own record is dated
+                    # after the cutoff: the late record stays visible but does
+                    # not count as completed. Future activities count too.
+                    status = "pending"
+                trainings.append({
+                    "activity_id": activity_id,
+                    "title": activity["title"],
+                    "on": activity["on"],
+                    "status": status,
+                    "completed_on": completed_on,
+                })
+            result_members.append({
+                "member_id": member_id,
+                "name": members[member_id]["name"],
+                "completed_count": completed_count,
+                "remaining_count": len(selected_ids) - completed_count,
+                "trainings": trainings,
+            })
+        return {"as_of": as_of, "required_count": len(selected_ids), "members": result_members}
+
     def merge_member(self, source_member_id, target_member_id):
         source = text(source_member_id, "source_member_id")
         target = text(target_member_id, "target_member_id")
