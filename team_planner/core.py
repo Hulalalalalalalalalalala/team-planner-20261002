@@ -348,6 +348,74 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return result
 
+    def correct_completions(self, records):
+        # The whole group takes effect at once: every entry is normalized and
+        # checked before any stored record is touched.
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "member_id", "completed_on"}:
+                raise ValueError("each record must contain only activity_id, member_id and completed_on")
+            activity_id = text(item["activity_id"], "activity_id")
+            member_id = text(item["member_id"], "member_id")
+            # null revokes an existing record; anything else must be a strict
+            # real YYYY-MM-DD date.
+            completed_on = None if item["completed_on"] is None else day(item["completed_on"], "completed_on")
+            # A repeated activity/member pair rejects the whole group even when
+            # both entries carry the same date; corrections are never merged.
+            pair = (activity_id, member_id)
+            if pair in seen:
+                raise ValueError("records must not contain duplicate activity and member pairs")
+            seen.add(pair)
+            entries.append((activity_id, member_id, completed_on))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        completions = data.get("completions", {})
+        # Validate every entry first: the activity and member must exist, the
+        # member must stay enrolled, the member's own completion record must
+        # already exist, and a replacement date must not precede the activity
+        # date. A history without a completions collection simply has nothing
+        # correctable.
+        checked = []
+        for activity_id, member_id, completed_on in entries:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            if member_id not in members:
+                raise ValueError("unknown member")
+            if member_id not in activity.get("participants", []):
+                raise ValueError("member is not enrolled in the activity")
+            done = completions.get(activity_id, {})
+            if member_id not in done:
+                raise ValueError("completion not recorded")
+            if completed_on is not None and date.fromisoformat(completed_on) < date.fromisoformat(activity["on"]):
+                raise ValueError("completed_on must be on or after the activity date")
+            checked.append((activity_id, member_id, completed_on, done[member_id]))
+        # Only the selected records change: a replacement overwrites the date,
+        # a revocation removes just that member's entry. Revoking neither
+        # cancels the enrollment nor frees the seat; participant order,
+        # profiles, activity fields, other records and extra fields are left
+        # untouched, and an emptied per-activity object is kept like any other.
+        result = []
+        changed = False
+        for activity_id, member_id, completed_on, previous_completed_on in checked:
+            activity = activities[activity_id]
+            if completed_on is None:
+                del completions[activity_id][member_id]
+                changed = True
+            elif completed_on != previous_completed_on:
+                completions[activity_id][member_id] = completed_on
+                changed = True
+            # A new date equal to the old one succeeds but changes nothing; if
+            # the whole group is like that the file is not rewritten.
+            result.append({"activity_id": activity_id, "member_id": member_id, "title": activity["title"], "on": activity["on"], "previous_completed_on": previous_completed_on, "completed_on": completed_on})
+        if changed:
+            self._write(data)
+        return result
+
     def completions(self, member_id):
         member_id = text(member_id, "member_id")
         data = self._read()

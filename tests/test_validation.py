@@ -163,6 +163,7 @@ class ValidationTests(unittest.TestCase):
             lambda: self.app.completions("M-001"),
             lambda: self.app.add_member("M-999", "新人"),
             lambda: self.app.enroll("A-001", "M-001"),
+            lambda: self.app.correct_completions([{"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-16"}]),
         ]
         for index, document in enumerate(corrupt_documents):
             before = self.write(document)
@@ -192,6 +193,50 @@ class ValidationTests(unittest.TestCase):
                 {"activity_id": " A-002 ", "member_id": " M-001 ", "completed_on": "2026-10-15"},
             ])
         self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_batch_correction_also_rejects_broken_history(self):
+        # The correction runs the same whole-history validation: a valid group
+        # against a broken document fails with ValueError and leaves the bytes.
+        good_records = [{"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-16"}]
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.correct_completions(good_records)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A revocation group against broken history fails the same way.
+        with self.assertRaises(ValueError):
+            self.app.correct_completions([{"activity_id": "A-003", "member_id": "M-001", "completed_on": None}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken group (duplicate pair) fails argument validation before the
+        # filesystem is even touched, so the valid history stays byte-identical.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.correct_completions([
+                {"activity_id": "A-003", "member_id": "M-001", "completed_on": "2026-10-16"},
+                {"activity_id": " A-003 ", "member_id": " M-001 ", "completed_on": None},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correction_on_missing_completions_is_value_error(self):
+        # A valid old document without completions has nothing correctable.
+        document = {
+            "members": {"M-001": {"member_id": "M-001", "name": "小陈"}},
+            "activities": {"A-001": {"activity_id": "A-001", "title": "培训", "on": "2026-10-15", "capacity": 2, "participants": ["M-001"]}},
+        }
+        before = self.write(document)
+        with self.assertRaises(ValueError):
+            self.app.correct_completions([{"activity_id": "A-001", "member_id": "M-001", "completed_on": None}])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_correction_os_error_reading_stays_an_os_error(self):
+        # data.json itself being a directory is an operating-system error, not
+        # a validation failure, even for a well-formed correction group.
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.correct_completions([{"activity_id": "A-001", "member_id": "M-001", "completed_on": None}])
 
     def test_unrelated_broken_record_is_not_hidden_by_filters(self):
         # Querying M-001's own data must still fail because of M-002's broken
