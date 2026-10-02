@@ -265,6 +265,71 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return selected
 
+    def preview_reschedule_activities(self, changes):
+        # Read-only preview of reschedule_activities: the same normalization
+        # and validation, but nothing is ever written back and no missing
+        # directory or file is created.
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("changes must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in changes:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "on"}:
+                raise ValueError("each change must contain only activity_id and on")
+            activity_id = text(item["activity_id"], "activity_id")
+            on = day(item["on"], "on")
+            if activity_id in seen:
+                raise ValueError("changes must not contain duplicate activity ids")
+            seen.add(activity_id)
+            entries.append((activity_id, on))
+        data = self._read()
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        selected = []
+        for activity_id, on in entries:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            selected.append(activity)
+        # Dates are compared after the whole group is applied: selected
+        # activities use their requested date, everything else keeps its own,
+        # so a feasible swap shows no conflict.
+        final_on = {activity_id: on for activity_id, on in entries}
+        preview = []
+        for activity, (activity_id, on) in zip(selected, entries):
+            previous_on = activity["on"]
+            completion_member_ids = []
+            conflicts = []
+            # Only a real date change is checked; an unchanged date reports no
+            # obstacles even when completion records or old conflicts exist.
+            if on != previous_on:
+                completion_member_ids = sorted(completions.get(activity_id, {}))
+                participants = set(activity.get("participants", []))
+                blocked = {}
+                for other_id, other in activities.items():
+                    if other_id == activity_id:
+                        continue
+                    other_on = final_on.get(other_id, other.get("on"))
+                    if other_on != on:
+                        continue
+                    # Completed enrollments keep their seats, so participants
+                    # lists already cover finished trainings; other members'
+                    # enrollments never count as a conflict.
+                    for member_id in participants & set(other.get("participants", [])):
+                        blocked.setdefault(member_id, []).append(other_id)
+                conflicts = [{"member_id": member_id, "activity_ids": sorted(ids)} for member_id, ids in sorted(blocked.items())]
+            preview.append({
+                "activity_id": activity_id,
+                "previous_on": previous_on,
+                "on": on,
+                "completion_member_ids": completion_member_ids,
+                "conflicts": conflicts,
+            })
+        # Both kinds of obstacles are reported together; only a fully clear
+        # group can be rescheduled.
+        can_reschedule = all(not item["completion_member_ids"] and not item["conflicts"] for item in preview)
+        return {"can_reschedule": can_reschedule, "activities": preview}
+
     def roster(self, activity_id):
         data = self._read()
         activity = data.get("activities", {}).get(activity_id)

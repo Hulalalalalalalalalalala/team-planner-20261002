@@ -232,6 +232,34 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.app.correct_completions([{"activity_id": "A-001", "member_id": "M-001", "completed_on": None}])
 
+    def test_preview_reschedule_also_rejects_broken_history(self):
+        # The preview runs the same whole-history validation: a valid group
+        # against a broken document fails with ValueError and leaves the bytes.
+        good_changes = [{"activity_id": "A-002", "on": "2026-10-16"}]
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.preview_reschedule_activities(good_changes)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken group (duplicate id after normalization) fails argument
+        # validation before the filesystem is even touched.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.preview_reschedule_activities([
+                {"activity_id": "A-002", "on": "2026-10-16"},
+                {"activity_id": " A-002 ", "on": "2026-10-17"},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_preview_reschedule_os_error_stays_an_os_error(self):
+        # data.json itself being a directory stays an operating-system error.
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.preview_reschedule_activities([{"activity_id": "A-001", "on": "2026-10-16"}])
+
     def test_unrelated_broken_record_is_not_hidden_by_filters(self):
         # Querying M-001's own data must still fail because of M-002's broken
         # profile and A-002's broken completion record.
