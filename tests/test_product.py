@@ -590,5 +590,192 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]], [])
 
+    def _reschedule_batch_ready(self):
+        # 小陈 is enrolled in A-001 (15th) and A-002 (16th); 小林 alone holds
+        # A-003 on the 20th.
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-001", "十五号培训", "2026-10-15", 4)
+        self.app.create_activity("A-002", "十六号培训", "2026-10-16", 4)
+        self.app.create_activity("A-003", "二十号培训", "2026-10-20", 4)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-003", "M-002")
+
+    def test_reschedule_batch_swap_dates_returns_input_order(self):
+        self._reschedule_batch_ready()
+        result = self.app.reschedule_activities([
+            {"activity_id": " A-002 ", "on": "2026-10-15"},
+            {"activity_id": "A-001", "on": "2026-10-16"},
+        ])
+        self.assertEqual(result, [
+            {"activity_id": "A-002", "title": "十六号培训", "on": "2026-10-15", "capacity": 4, "participants": ["M-001"]},
+            {"activity_id": "A-001", "title": "十五号培训", "on": "2026-10-16", "capacity": 4, "participants": ["M-001"]},
+        ])
+        # The swap survives reopening and shows up in list, rosters and schedules.
+        reopened = TeamPlanner(self.root)
+        by_id = {a["activity_id"]: a for a in reopened.activities()}
+        self.assertEqual(by_id["A-001"]["on"], "2026-10-16")
+        self.assertEqual(by_id["A-002"]["on"], "2026-10-15")
+        self.assertEqual(reopened.roster("A-002")["on"], "2026-10-15")
+        self.assertEqual([(r["activity_id"], r["on"], r["conflict_activity_ids"]) for r in reopened.member_schedule("M-001")],
+                         [("A-002", "2026-10-15", []), ("A-001", "2026-10-16", [])])
+
+    def test_reschedule_batch_other_members_and_group_external_dates(self):
+        self._reschedule_batch_ready()
+        # Moving onto the 20th, where only 小林 is enrolled in another activity,
+        # is allowed; the swap exchanges the two shared activities at once.
+        result = self.app.reschedule_activities([
+            {"activity_id": "A-001", "on": "2026-10-20"},
+            {"activity_id": "A-002", "on": "2026-10-15"},
+        ])
+        self.assertEqual([a["on"] for a in result], ["2026-10-20", "2026-10-15"])
+        # A-003 keeps its own date and participants.
+        self.assertEqual(self.app.roster("A-003")["members"], [{"member_id": "M-002", "name": "小林"}])
+
+    def test_reschedule_batch_final_same_day_conflict_is_atomic(self):
+        self._reschedule_batch_ready()
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reschedule_activities([
+                {"activity_id": "A-001", "on": "2026-10-16"},
+                {"activity_id": "A-002", "on": "2026-10-16"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.roster("A-001")["on"], "2026-10-15")
+        self.assertEqual(self.app.roster("A-002")["on"], "2026-10-16")
+
+    def test_reschedule_batch_completed_enrollment_outside_group_counts(self):
+        self._reschedule_batch_ready()
+        # A completed enrollment of the same member on the final date blocks too.
+        self.app.create_activity("A-004", "十六号已完成", "2026-10-16", 4)
+        self.app.enroll("A-004", "M-001")
+        self.app.record_completion("A-004", "M-001", "2026-10-16")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reschedule_activities([
+                {"activity_id": "A-001", "on": "2026-10-16"},
+                {"activity_id": "A-002", "on": "2026-10-15"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_reschedule_batch_completion_rules_per_activity(self):
+        self._reschedule_batch_ready()
+        # 小林's completion for A-003 does not block 小陈's move onto the 20th.
+        self.app.record_completion("A-003", "M-002", "2026-10-20")
+        self.app.reschedule_activities([{"activity_id": "A-001", "on": "2026-10-20"}])
+        # A moving activity carrying any completion record is rejected.
+        self.app.create_activity("A-005", "二十一号", "2026-10-21", 4)
+        self.app.enroll("A-005", "M-002")
+        self.app.record_completion("A-005", "M-002", "2026-10-21")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reschedule_activities([{"activity_id": "A-005", "on": "2026-10-22"}])
+        # Even with an unchanged sibling in the same call the batch fails.
+        with self.assertRaises(ValueError):
+            self.app.reschedule_activities([
+                {"activity_id": "A-002", "on": "2026-10-15"},
+                {"activity_id": "A-005", "on": "2026-10-22"},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_reschedule_batch_all_unchanged_is_noop(self):
+        self._reschedule_batch_ready()
+        # A-001 and A-002 already share a participant on different dates; add a
+        # completion record to a selected unchanged activity.
+        self.app.record_completion("A-002", "M-001", "2026-10-16")
+        before = self.app.path.read_bytes()
+        result = self.app.reschedule_activities([
+            {"activity_id": "A-002", "on": "2026-10-16"},
+            {"activity_id": "A-001", "on": "2026-10-15"},
+        ])
+        self.assertEqual([a["activity_id"] for a in result], ["A-002", "A-001"])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_reschedule_batch_rejections_leave_bytes_unchanged(self):
+        self._reschedule_batch_ready()
+        before = self.app.path.read_bytes()
+        for changes in [
+            None,
+            [],
+            {},
+            "x",
+            3,
+            [42],
+            [{"activity_id": "A-001"}],
+            [{"on": "2026-10-15"}],
+            [{"activity_id": "A-001", "on": "2026-10-15", "extra": 1}],
+            [{"activity_id": "   ", "on": "2026-10-15"}],
+            [{"activity_id": 9, "on": "2026-10-15"}],
+            [{"activity_id": "A-001", "on": "2026-02-30"}],
+            [{"activity_id": "A-001", "on": " 2026-10-15"}],
+            [{"activity_id": "A-001", "on": "2026-10-15 "}, ],
+            [{"activity_id": "A-001", "on": 10}],
+            [{"activity_id": "A-001", "on": "2026/10/15"}],
+            [{"activity_id": "GHOST", "on": "2026-10-15"}],
+            [{"activity_id": "A-001", "on": "2026-10-16"},
+             {"activity_id": " A-001 ", "on": "2026-10-17"}],
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.reschedule_activities(changes)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_reschedule_batch_invalid_does_not_create_file(self):
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        for changes in [[], [{"activity_id": "A", "on": "2026-10-15"}]]:
+            with self.assertRaises(ValueError):
+                fresh.reschedule_activities(changes)
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_reschedule_batch_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.create_activity("A-001", "旧活动一", "2026-10-15", 2)
+        other.create_activity("A-002", "旧活动二", "2026-10-16", 2)
+        other.enroll("A-001", "M-001")
+        other.enroll("A-002", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        result = TeamPlanner(legacy).reschedule_activities([
+            {"activity_id": "A-001", "on": "2026-10-16"},
+            {"activity_id": "A-002", "on": "2026-10-15"},
+        ])
+        self.assertEqual([a["on"] for a in result], ["2026-10-16", "2026-10-15"])
+
+    def test_cli_reschedule_batch_success_failure_and_partial_array(self):
+        self._reschedule_batch_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "reschedule-batch", name], text=True, capture_output=True)
+        ok = run({"changes": [
+            {"activity_id": "A-001", "on": "2026-10-16"},
+            {"activity_id": "A-002", "on": "2026-10-15"},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual([a["on"] for a in json.loads(ok.stdout)], ["2026-10-16", "2026-10-15"])
+        bad = run({"changes": [
+            {"activity_id": "A-001", "on": "2026-10-15"},
+            {"activity_id": "A-002", "on": "2026-10-15"},
+        ]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # Top-level array: independent batches, the first success stays after a
+        # later failure, and nothing is printed on stdout.
+        partial = run([
+            {"changes": [{"activity_id": "A-001", "on": "2026-10-17"}]},
+            {"changes": [{"activity_id": "GHOST", "on": "2026-10-18"}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(TeamPlanner(self.root).roster("A-001")["on"], "2026-10-17")
+        self.assertEqual(TeamPlanner(self.root).roster("A-002")["on"], "2026-10-15")
+
 if __name__ == "__main__":
     unittest.main()

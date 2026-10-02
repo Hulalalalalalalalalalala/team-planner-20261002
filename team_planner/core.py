@@ -135,6 +135,61 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return activity
 
+    def reschedule_activities(self, changes):
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("changes must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in changes:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "on"}:
+                raise ValueError("each change must contain only activity_id and on")
+            activity_id = text(item["activity_id"], "activity_id")
+            on = day(item["on"], "on")
+            if activity_id in seen:
+                raise ValueError("changes must not contain duplicate activity ids")
+            seen.add(activity_id)
+            entries.append((activity_id, on))
+        data = self._read()
+        activities = data.get("activities", {})
+        selected = []
+        for activity_id, on in entries:
+            activity = activities.get(activity_id)
+            if activity is None:
+                raise ValueError("unknown activity")
+            selected.append(activity)
+        # Only activities whose date actually moves are constrained; entries
+        # keeping their date may carry completion records or old conflicts.
+        moving = [(activity, on) for activity, (_, on) in zip(selected, entries) if on != activity["on"]]
+        # Nothing to change: return the activities as they are and leave the
+        # file untouched, even when completion records or conflicts exist.
+        if not moving:
+            return selected
+        completions = data.get("completions", {})
+        final_on = {activity_id: on for activity_id, on in entries}
+        # Conflicts are judged against every activity's date AFTER the whole
+        # group moves, so feasible swaps are not rejected by an intermediate
+        # state. Validate everything before touching any date.
+        for activity, on in moving:
+            activity_id = activity["activity_id"]
+            if completions.get(activity_id):
+                raise ValueError("activity already has completion records")
+            participants = set(activity.get("participants", []))
+            for other_id, other in activities.items():
+                if other_id == activity_id:
+                    continue
+                other_on = final_on.get(other_id, other.get("on"))
+                if other_on != on:
+                    continue
+                # Completion keeps the enrollment, so participants lists already
+                # include members who finished the training; an activity in
+                # which only other members are enrolled is no conflict.
+                if participants & set(other.get("participants", [])):
+                    raise ValueError("participant is enrolled in another activity on that date")
+        for activity, on in moving:
+            activity["on"] = on
+        self._write(data)
+        return selected
+
     def roster(self, activity_id):
         data = self._read()
         activity = data.get("activities", {}).get(activity_id)
