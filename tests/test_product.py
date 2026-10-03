@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -3151,6 +3152,235 @@ class ProductTests(unittest.TestCase):
         partial = run([
             {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "as_of": "2026-10-16", "member_ids": []},
             {"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "as_of": "2026-10-16"},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def _timeline_ready(self):
+        # 与 _validity_ready 相同的基础数据，供有效期区间查询使用。
+        self._validity_ready()
+
+    def test_training_timeline_periods_cover_range_and_merge(self):
+        self._timeline_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        result = self.app.training_validity_timeline(groups, "2026-10-14", "2026-10-19")
+        self.assertEqual(result["from_on"], "2026-10-14")
+        self.assertEqual(result["to_on"], "2026-10-19")
+        self.assertEqual([m["member_id"] for m in result["members"]], ["M-001", "M-002", "M-003"])
+        chen, lin, zhou = result["members"]
+        self.assertEqual(chen["name"], "小陈")
+        # 小陈 2026-10-15 完成且有效三天：一日 pending、三日 valid、两日 expired。
+        self.assertEqual(chen["groups"], [{
+            "group_id": "G-ENTRY",
+            "periods": [
+                {"from_on": "2026-10-14", "to_on": "2026-10-14", "status": "pending", "activity_id": None, "completed_on": None},
+                {"from_on": "2026-10-15", "to_on": "2026-10-17", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+                {"from_on": "2026-10-18", "to_on": "2026-10-19", "status": "expired", "activity_id": "A-001", "completed_on": "2026-10-15"},
+            ],
+        }])
+        # 小林已报名无记录：整段一个 pending 区间；小周未报名：整段 not_enrolled。
+        self.assertEqual(lin["groups"][0]["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-19", "status": "pending", "activity_id": None, "completed_on": None},
+        ])
+        self.assertEqual(zhou["groups"][0]["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-19", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+        ])
+
+    def test_training_timeline_matches_daily_validity_and_covers_closed_range(self):
+        self._timeline_ready()
+        groups = [
+            {"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3},
+            {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"], "valid_days": 5},
+            {"group_id": "G-EXTRA", "activity_ids": ["A-005", "A-006"], "valid_days": 30},
+        ]
+        result = self.app.training_validity_timeline(groups, "2026-10-10", "2026-10-26")
+        # 每个区间闭区间相接、完整覆盖查询范围且无重叠，按起日升序。
+        for member in result["members"]:
+            for group in member["groups"]:
+                periods = group["periods"]
+                self.assertEqual(periods[0]["from_on"], "2026-10-10")
+                self.assertEqual(periods[-1]["to_on"], "2026-10-26")
+                for earlier, later in zip(periods, periods[1:]):
+                    self.assertEqual(
+                        date.fromisoformat(earlier["to_on"]) + timedelta(days=1),
+                        date.fromisoformat(later["from_on"]),
+                    )
+                    self.assertLess(earlier["to_on"], later["from_on"])
+                # 相邻区间的（状态、活动、完成日）三元组绝不相同：合并是最长的。
+                for earlier, later in zip(periods, periods[1:]):
+                    self.assertNotEqual(
+                        (earlier["status"], earlier["activity_id"], earlier["completed_on"]),
+                        (later["status"], later["activity_id"], later["completed_on"]),
+                    )
+        # 每一天的三项与当日 training-validity 的对应组结果完全一致。
+        day = date(2026, 10, 10)
+        while day <= date(2026, 10, 26):
+            daily = self.app.training_validity(groups, day.isoformat())
+            for member, daily_member in zip(result["members"], daily["members"]):
+                for group, daily_group in zip(member["groups"], daily_member["groups"]):
+                    period = next(p for p in group["periods"] if p["from_on"] <= day.isoformat() <= p["to_on"])
+                    self.assertEqual(
+                        (period["status"], period["activity_id"], period["completed_on"]),
+                        (daily_group["status"], daily_group["activity_id"], daily_group["completed_on"]),
+                    )
+            day += timedelta(days=1)
+
+    def test_training_timeline_record_change_splits_and_future_not_masking(self):
+        self._timeline_ready()
+        # 小陈入门一 10-15 完成（三天有效），再在入门二登记 10-18 的完成记录：
+        # 10-18 起选取依据改变，状态同为 valid 也必须分段；10-18 之前旧记录不被遮盖。
+        self.app.enroll("A-002", "M-001")
+        self.app.record_completion("A-002", "M-001", "2026-10-18")
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        result = self.app.training_validity_timeline(groups, "2026-10-14", "2026-10-22", ["M-001"])
+        self.assertEqual(result["members"][0]["groups"][0]["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-14", "status": "pending", "activity_id": None, "completed_on": None},
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-20", "status": "valid", "activity_id": "A-002", "completed_on": "2026-10-18"},
+            {"from_on": "2026-10-21", "to_on": "2026-10-22", "status": "expired", "activity_id": "A-002", "completed_on": "2026-10-18"},
+        ])
+        # 完成记录在查询范围之后：整段按旧记录判定，未来记录不参与也不遮盖。
+        result = self.app.training_validity_timeline(groups, "2026-10-14", "2026-10-17", ["M-001"])
+        self.assertEqual(result["members"][0]["groups"][0]["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-14", "status": "pending", "activity_id": None, "completed_on": None},
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+        ])
+        # 小周两场同日完成：完成日期相同按活动日期、活动标识升序取首条。
+        extra = [{"group_id": "G-EXTRA", "activity_ids": ["A-005", "A-006"], "valid_days": 30}]
+        result = self.app.training_validity_timeline(extra, "2026-10-11", "2026-10-12", ["M-003"])
+        self.assertEqual(result["members"][0]["groups"][0]["periods"], [
+            {"from_on": "2026-10-11", "to_on": "2026-10-11", "status": "pending", "activity_id": None, "completed_on": None},
+            {"from_on": "2026-10-12", "to_on": "2026-10-12", "status": "valid", "activity_id": "A-005", "completed_on": "2026-10-12"},
+        ])
+
+    def test_training_timeline_member_selection_and_single_day(self):
+        self._timeline_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        result = self.app.training_validity_timeline(groups, "2026-10-16", "2026-10-17", [" M-003 ", "M-001"])
+        self.assertEqual([m["member_id"] for m in result["members"]], ["M-003", "M-001"])
+        # 成员选择为空数组时 members 为空，起止日期原样返回。
+        empty = self.app.training_validity_timeline(groups, "2026-10-16", "2026-10-17", [])
+        self.assertEqual(empty, {"from_on": "2026-10-16", "to_on": "2026-10-17", "members": []})
+        # 起止相等表示查询一天：单个一日区间。
+        single = self.app.training_validity_timeline(groups, "2026-10-18", "2026-10-18", ["M-001"])
+        self.assertEqual(single["members"][0]["groups"][0]["periods"], [
+            {"from_on": "2026-10-18", "to_on": "2026-10-18", "status": "expired", "activity_id": "A-001", "completed_on": "2026-10-15"},
+        ])
+
+    def test_training_timeline_validity_beyond_date_max(self):
+        self._timeline_ready()
+        # 有效期越过 9999-12-31：只按查询范围给出状态，不报溢出错误。
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001"], "valid_days": 10 ** 12}]
+        result = self.app.training_validity_timeline(groups, "2026-10-14", "2026-10-20", ["M-001"])
+        self.assertEqual(result["members"][0]["groups"][0]["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-14", "status": "pending", "activity_id": None, "completed_on": None},
+            {"from_on": "2026-10-15", "to_on": "2026-10-20", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+        ])
+
+    def test_training_timeline_rejections(self):
+        self._timeline_ready()
+        valid_groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        for groups in [None, [], "x", [{}],
+                      [{"group_id": "G", "activity_ids": ["A-001"]}],
+                      [{"group_id": "G", "valid_days": 3}],
+                      [{"activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "extra": 1}],
+                      [{"group_id": "  ", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": None, "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": [], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001", " A-001 "], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": True}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 0}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": "3"}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"], "valid_days": 3},
+                       {"group_id": "G1", "activity_ids": ["A-002"], "valid_days": 3}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"], "valid_days": 3},
+                       {"group_id": "G2", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G1", "activity_ids": ["GHOST"], "valid_days": 3}]]:
+            with self.assertRaises(ValueError, msg=groups):
+                self.app.training_validity_timeline(groups, "2026-10-14", "2026-10-19")
+        for from_on, to_on in [("2026-02-30", "2026-10-19"), (" 2026-10-14", "2026-10-19"),
+                               ("2026-10-14", "2026/10/19"), (20261014, "2026-10-19"),
+                               ("2026-10-14", None), ("2026-10-20", "2026-10-19")]:
+            with self.assertRaises(ValueError, msg=(from_on, to_on)):
+                self.app.training_validity_timeline(valid_groups, from_on, to_on)
+        for member_ids in ["M-001", [" "], ["M-001", " M-001 "], ["M-001", "GHOST"]]:
+            with self.assertRaises(ValueError, msg=member_ids):
+                self.app.training_validity_timeline(valid_groups, "2026-10-14", "2026-10-19", member_ids)
+
+    def test_training_timeline_never_writes_and_legacy_data(self):
+        self._timeline_ready()
+        before = self.app.path.read_bytes()
+        self.app.training_validity_timeline(
+            [{"group_id": "G", "activity_ids": ["A-001", "A-002"], "valid_days": 3}], "2026-10-14", "2026-10-19")
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.training_validity_timeline(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "2026-10-14", "2026-10-19")
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 旧数据缺少 completions：按无记录处理，查询不补写该字段。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.training_validity_timeline(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}],
+            "2026-10-14", "2026-10-19", member_ids=["M-001", "M-003"])
+        self.assertEqual([p["status"] for p in result["members"][0]["groups"][0]["periods"]], ["pending"])
+        self.assertEqual([p["status"] for p in result["members"][1]["groups"][0]["periods"]], ["not_enrolled"])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty-timeline"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.training_validity_timeline(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-14", "2026-10-19")
+        self.assertFalse(empty.exists())
+
+    def test_training_timeline_broken_history_and_os_error(self):
+        self._timeline_ready()
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.training_validity_timeline(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-14", "2026-10-19")
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.training_validity_timeline(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-14", "2026-10-19")
+
+    def test_cli_training_timeline_success_failure_and_partial_array(self):
+        self._timeline_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "training-timeline", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"], "valid_days": 3}],
+                  "from_on": "2026-10-14", "to_on": "2026-10-19", "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["from_on"], "2026-10-14")
+        self.assertEqual(value["to_on"], "2026-10-19")
+        self.assertEqual(value["members"][0]["groups"][0]["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-14", "status": "pending", "activity_id": None, "completed_on": None},
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-19", "status": "expired", "activity_id": "A-001", "completed_on": "2026-10-15"},
+        ])
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                   "from_on": "2026-10-14", "to_on": "2026-10-19"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+             "from_on": "2026-10-14", "to_on": "2026-10-19", "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+             "from_on": "2026-10-14", "to_on": "2026-10-19"},
         ])
         self.assertEqual(partial.returncode, 2)
         self.assertIn("error", json.loads(partial.stderr))
