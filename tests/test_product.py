@@ -2973,5 +2973,189 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _validity_ready(self):
+        # 与 _requirements_ready 相同的基础数据，供复训有效期核对使用。
+        self._requirements_ready()
+
+    def test_training_validity_statuses_counts_and_order(self):
+        self._validity_ready()
+        result = self.app.training_validity([
+            {"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3},
+            {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"], "valid_days": 5},
+            {"group_id": "G-EXTRA", "activity_ids": ["A-005", "A-006"], "valid_days": 30},
+        ], "2026-10-16")
+        self.assertEqual(result["as_of"], "2026-10-16")
+        self.assertEqual(result["required_count"], 3)
+        self.assertEqual([m["member_id"] for m in result["members"]], ["M-001", "M-002", "M-003"])
+        chen, lin, zhou = result["members"]
+        # 小陈 10-15 完成入门一，距 10-16 一天，三天有效：valid；进阶场的记录在
+        # 截止日之后，不参与选取，本人已报名故 pending。
+        self.assertEqual(chen, {
+            "member_id": "M-001", "name": "小陈", "valid_count": 1, "remaining_count": 2,
+            "groups": [
+                {"group_id": "G-ENTRY", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+                {"group_id": "G-ADV", "status": "pending", "activity_id": None, "completed_on": None},
+                {"group_id": "G-EXTRA", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+            ],
+        })
+        self.assertEqual(lin, {
+            "member_id": "M-002", "name": "小林", "valid_count": 0, "remaining_count": 3,
+            "groups": [
+                {"group_id": "G-ENTRY", "status": "pending", "activity_id": None, "completed_on": None},
+                {"group_id": "G-ADV", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+                {"group_id": "G-EXTRA", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+            ],
+        })
+        # 小周两场同日完成：完成日期相同按活动日期、活动标识升序取首条。
+        self.assertEqual(zhou["groups"][2], {"group_id": "G-EXTRA", "status": "valid", "activity_id": "A-005", "completed_on": "2026-10-12"})
+        self.assertEqual(zhou["valid_count"], 1)
+        self.assertEqual(zhou["remaining_count"], 2)
+
+    def test_training_validity_boundary_days_example(self):
+        self._validity_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        # 小陈 2026-10-15 完成、有效三天：10-17 仍有效，10-18 过期。
+        valid = self.app.training_validity(groups, "2026-10-17", member_ids=["M-001"])
+        self.assertEqual(valid["members"][0]["groups"][0], {"group_id": "G-ENTRY", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"})
+        expired = self.app.training_validity(groups, "2026-10-18", member_ids=["M-001"])
+        self.assertEqual(expired["members"][0]["groups"][0], {"group_id": "G-ENTRY", "status": "expired", "activity_id": "A-001", "completed_on": "2026-10-15"})
+        self.assertEqual(expired["members"][0]["valid_count"], 0)
+        self.assertEqual(expired["members"][0]["remaining_count"], 1)
+        # 完成日当天为第 0 天，一天有效期同样 valid。
+        same_day = self.app.training_validity(groups, "2026-10-15", member_ids=["M-001"])
+        self.assertEqual(same_day["members"][0]["groups"][0]["status"], "valid")
+
+    def test_training_validity_latest_record_wins_and_future_not_masking(self):
+        self._validity_ready()
+        # 小林在入门两场都完成：较晚的完成日期胜出，即使其活动日期更早。
+        self.app.enroll("A-001", "M-002")
+        self.app.record_completion("A-001", "M-002", "2026-10-16")
+        self.app.record_completion("A-002", "M-002", "2026-10-15")
+        result = self.app.training_validity(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}], "2026-10-16", member_ids=["M-002"],
+        )
+        self.assertEqual(result["members"][0]["groups"][0], {"group_id": "G-ENTRY", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-16"})
+        # 小陈的入门一 10-15 完成（三天有效）；再在入门二登记一条未来完成记录。
+        # 截至 10-18 旧记录已过期，未来记录不参与选取也不掩盖过期状态。
+        self.app.enroll("A-002", "M-001")
+        self.app.record_completion("A-002", "M-001", "2026-10-25")
+        result = self.app.training_validity(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}], "2026-10-18", member_ids=["M-001"],
+        )
+        self.assertEqual(result["members"][0]["groups"][0], {"group_id": "G-ENTRY", "status": "expired", "activity_id": "A-001", "completed_on": "2026-10-15"})
+        # 未来记录在更晚的截止日成为最新记录并重新判定有效期。
+        result = self.app.training_validity(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}], "2026-10-25", member_ids=["M-001"],
+        )
+        self.assertEqual(result["members"][0]["groups"][0], {"group_id": "G-ENTRY", "status": "valid", "activity_id": "A-002", "completed_on": "2026-10-25"})
+
+    def test_training_validity_member_selection_semantics(self):
+        self._validity_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        self.assertEqual([m["member_id"] for m in self.app.training_validity(groups, "2026-10-16")["members"]], ["M-001", "M-002", "M-003"])
+        self.assertEqual([m["member_id"] for m in self.app.training_validity(groups, "2026-10-16", None)["members"]], ["M-001", "M-002", "M-003"])
+        result = self.app.training_validity(groups, "2026-10-16", [" M-003 ", "M-001"])
+        self.assertEqual([m["member_id"] for m in result["members"]], ["M-003", "M-001"])
+        empty = self.app.training_validity(groups, "2026-10-16", [])
+        self.assertEqual(empty, {"as_of": "2026-10-16", "required_count": 1, "members": []})
+
+    def test_training_validity_rejections(self):
+        self._validity_ready()
+        valid_groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        for groups in [None, [], "x", [{}],
+                      [{"group_id": "G", "activity_ids": ["A-001"]}],
+                      [{"group_id": "G", "valid_days": 3}],
+                      [{"activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "extra": 1}],
+                      [{"group_id": "  ", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": 9, "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": None, "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": [], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001", " A-001 "], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": True}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": False}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 0}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": -1}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": "3"}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 1.0}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"], "valid_days": 3},
+                       {"group_id": "G1", "activity_ids": ["A-002"], "valid_days": 3}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"], "valid_days": 3},
+                       {"group_id": "G2", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G1", "activity_ids": ["GHOST"], "valid_days": 3}]]:
+            with self.assertRaises(ValueError, msg=groups):
+                self.app.training_validity(groups, "2026-10-16")
+        for as_of in ["2026-02-30", " 2026-10-16", "2026/10/16", 20261016, None]:
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.training_validity(valid_groups, as_of)
+        for member_ids in ["M-001", [" "], ["M-001", " M-001 "], ["M-001", "GHOST"]]:
+            with self.assertRaises(ValueError, msg=member_ids):
+                self.app.training_validity(valid_groups, "2026-10-16", member_ids)
+
+    def test_training_validity_never_writes_and_legacy_data(self):
+        self._validity_ready()
+        before = self.app.path.read_bytes()
+        self.app.training_validity([{"group_id": "G", "activity_ids": ["A-001", "A-002"], "valid_days": 3}], "2026-10-16")
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.training_validity([{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "2026-10-16")
+        self.assertEqual(before, self.app.path.read_bytes())
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.training_validity(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3},
+             {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"], "valid_days": 3}],
+            "2026-10-16", member_ids=["M-001", "M-002"],
+        )
+        self.assertEqual([g["status"] for g in result["members"][0]["groups"]], ["pending", "pending"])
+        self.assertEqual([g["status"] for g in result["members"][1]["groups"]], ["pending", "not_enrolled"])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        empty = self.root / "empty-validity"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.training_validity([{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-16")
+        self.assertFalse(empty.exists())
+
+    def test_training_validity_broken_history_and_os_error(self):
+        self._validity_ready()
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.training_validity([{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-16")
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.training_validity([{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-16")
+
+    def test_cli_training_validity_success_failure_and_partial_array(self):
+        self._validity_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "training-validity", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"], "valid_days": 3}], "as_of": "2026-10-17", "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["required_count"], 1)
+        self.assertEqual(value["members"][0]["groups"], [
+            {"group_id": "G-ENTRY", "status": "valid", "activity_id": "A-001", "completed_on": "2026-10-15"},
+        ])
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "as_of": "2026-10-16"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "as_of": "2026-10-16", "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "as_of": "2026-10-16"},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
 if __name__ == "__main__":
     unittest.main()
