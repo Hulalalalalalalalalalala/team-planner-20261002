@@ -2208,6 +2208,207 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([m["member_id"] for m in reopened.roster("A-003")["members"]], ["M-001"])
         self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-001", "M-002"])
 
+    def test_preview_enroll_feasible_group_then_commits(self):
+        self._enroll_batch_ready()
+        before = self.app.path.read_bytes()
+        # Identifiers are trimmed; one member may join several activities on
+        # different dates and one activity may receive several members.
+        records = [
+            {"activity_id": " A-002 ", "member_id": "M-001"},
+            {"activity_id": "A-002", "member_id": " M-002 "},
+            {"activity_id": "A-003", "member_id": "M-001"},
+        ]
+        result = self.app.preview_enrollments(records)
+        self.assertEqual(result, {"can_enroll": True, "records": [
+            {"activity_id": "A-002", "member_id": "M-001", "remaining_seats": 0, "conflict_activity_ids": []},
+            {"activity_id": "A-002", "member_id": "M-002", "remaining_seats": 0, "conflict_activity_ids": []},
+            {"activity_id": "A-003", "member_id": "M-001", "remaining_seats": 1, "conflict_activity_ids": []},
+        ]})
+        # The preview is read-only: the file bytes are untouched and no
+        # enrollment happened.
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.roster("A-002")["members"], [])
+        # With the data unchanged the feasible preview commits as-is.
+        enrolled = self.app.enroll_batch(records)
+        self.assertEqual([a["participants"] for a in enrolled], [["M-001", "M-002"], ["M-001", "M-002"], ["M-001"]])
+
+    def test_preview_enroll_last_seat_overflow_is_shared_and_negative(self):
+        self._enroll_batch_ready()
+        # A-001 has exactly one free seat: 小林 and 小吴 cannot both take it,
+        # so both entries show the same negative count.
+        result = self.app.preview_enrollments([
+            {"activity_id": "A-001", "member_id": "M-002"},
+            {"activity_id": "A-001", "member_id": "M-004"},
+        ])
+        self.assertEqual(result, {"can_enroll": False, "records": [
+            {"activity_id": "A-001", "member_id": "M-002", "remaining_seats": -1, "conflict_activity_ids": []},
+            {"activity_id": "A-001", "member_id": "M-004", "remaining_seats": -1, "conflict_activity_ids": []},
+        ]})
+        # The completed enrollment in A-004 keeps its seat: two additions to
+        # a capacity-2 activity overflow as well.
+        result = self.app.preview_enrollments([
+            {"activity_id": "A-004", "member_id": "M-002"},
+            {"activity_id": "A-004", "member_id": "M-004"},
+        ])
+        self.assertEqual([r["remaining_seats"] for r in result["records"]], [-1, -1])
+        self.assertFalse(result["can_enroll"])
+        self.assertEqual(self.app.roster("A-001")["members"], [{"member_id": "M-003", "name": "小周"}])
+
+    def test_preview_enroll_same_day_conflicts_listed_both_ways(self):
+        self._enroll_batch_ready()
+        # Two entries of the group on the same date list each other.
+        result = self.app.preview_enrollments([
+            {"activity_id": "A-002", "member_id": "M-002"},
+            {"activity_id": "A-005", "member_id": "M-002"},
+        ])
+        self.assertEqual(result, {"can_enroll": False, "records": [
+            {"activity_id": "A-002", "member_id": "M-002", "remaining_seats": 1, "conflict_activity_ids": ["A-005"]},
+            {"activity_id": "A-005", "member_id": "M-002", "remaining_seats": 1, "conflict_activity_ids": ["A-002"]},
+        ]})
+        # 小陈's completed A-004 still occupies the 15th: joining A-001 on the
+        # same date conflicts even though one seat is free.
+        result = self.app.preview_enrollments([{"activity_id": "A-001", "member_id": "M-001"}])
+        self.assertEqual(result, {"can_enroll": False, "records": [
+            {"activity_id": "A-001", "member_id": "M-001", "remaining_seats": 0, "conflict_activity_ids": ["A-004"]},
+        ]})
+        # Other members' enrollments are no conflict: 小林 next to 小周 in
+        # A-001 is feasible.
+        result = self.app.preview_enrollments([{"activity_id": "A-001", "member_id": "M-002"}])
+        self.assertEqual(result, {"can_enroll": True, "records": [
+            {"activity_id": "A-001", "member_id": "M-002", "remaining_seats": 0, "conflict_activity_ids": []},
+        ]})
+
+    def test_preview_enroll_overflow_and_conflict_reported_together(self):
+        self._enroll_batch_ready()
+        # The single enroll still allows same-day enrollments: 小林 picks up
+        # the last seat of A-001 on the 15th.
+        self.app.enroll("A-001", "M-002")
+        before = self.app.path.read_bytes()
+        # Both additions to the completed A-004 overflow; 小林's entry also
+        # conflicts with his A-001 seat. Both obstacles are reported, and the
+        # conflict-free 小吴 entry still shows its own negative count.
+        result = self.app.preview_enrollments([
+            {"activity_id": "A-004", "member_id": "M-002"},
+            {"activity_id": "A-004", "member_id": "M-004"},
+        ])
+        self.assertEqual(result, {"can_enroll": False, "records": [
+            {"activity_id": "A-004", "member_id": "M-002", "remaining_seats": -1, "conflict_activity_ids": ["A-001"]},
+            {"activity_id": "A-004", "member_id": "M-004", "remaining_seats": -1, "conflict_activity_ids": []},
+        ]})
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_preview_enroll_unrelated_historical_conflict_not_listed(self):
+        self._enroll_batch_ready()
+        # 小陈 picks up a second seat on the 15th via the single enroll; that
+        # historical conflict sits on a date the group does not touch, so
+        # joining A-002 on the 16th shows no conflict.
+        self.app.enroll("A-001", "M-001")
+        result = self.app.preview_enrollments([{"activity_id": "A-002", "member_id": "M-001"}])
+        self.assertEqual(result, {"can_enroll": True, "records": [
+            {"activity_id": "A-002", "member_id": "M-001", "remaining_seats": 1, "conflict_activity_ids": []},
+        ]})
+
+    def test_preview_enroll_invalid_never_creates_or_rewrites(self):
+        self._enroll_batch_ready()
+        before = self.app.path.read_bytes()
+        for records in [
+            None,
+            [],
+            "x",
+            3,
+            {},
+            [42],
+            [None],
+            [[]],
+            [{"activity_id": "A-002"}],
+            [{"member_id": "M-001"}],
+            [{"activity_id": "A-002", "member_id": "M-001", "extra": 1}],
+            [{"activity_id": "   ", "member_id": "M-001"}],
+            [{"activity_id": 9, "member_id": "M-001"}],
+            [{"activity_id": "A-002", "member_id": None}],
+            [{"activity_id": "A-002", "member_id": "  "}],
+            [{"activity_id": "GHOST", "member_id": "M-001"}],
+            [{"activity_id": "A-002", "member_id": "GHOST"}],
+            [{"activity_id": "A-001", "member_id": "M-003"}],  # already enrolled
+            [{"activity_id": "A-004", "member_id": "M-001"}],  # completed stays enrolled
+            # Duplicate activity/member pair after trimming.
+            [{"activity_id": " A-002 ", "member_id": "M-002"},
+             {"activity_id": "A-002", "member_id": " M-002 "}],
+            # The last entry fails; a valid earlier entry cannot save it.
+            [{"activity_id": "A-002", "member_id": "M-002"},
+             {"activity_id": "A-001", "member_id": "M-003"}],
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.preview_enrollments(records)
+            self.assertEqual(before, self.app.path.read_bytes())
+        # A missing history fails the business rules without creating the
+        # directory or data.json.
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.preview_enrollments([{"activity_id": "A", "member_id": "M"}])
+        self.assertFalse(empty.exists())
+        self.assertFalse((empty / "data.json").exists())
+
+    def test_preview_enroll_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        other = TeamPlanner(legacy)
+        other.add_member("M-001", "小陈")
+        other.add_member("M-002", "小林")
+        other.create_activity("A-001", "旧活动", "2026-10-15", 2)
+        other.enroll("A-001", "M-001")
+        raw = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completions", raw)
+        before = (legacy / "data.json").read_bytes()
+        result = TeamPlanner(legacy).preview_enrollments([{"activity_id": "A-001", "member_id": "M-002"}])
+        self.assertEqual(result, {"can_enroll": True, "records": [
+            {"activity_id": "A-001", "member_id": "M-002", "remaining_seats": 0, "conflict_activity_ids": []},
+        ]})
+        self.assertEqual(before, (legacy / "data.json").read_bytes())
+        self.assertNotIn("completions", json.loads((legacy / "data.json").read_text(encoding="utf-8")))
+
+    def test_cli_preview_enroll_success_failure_and_no_writes(self):
+        self._enroll_batch_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "preview-enroll", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"records": [
+            {"activity_id": " A-002 ", "member_id": "M-001"},
+            {"activity_id": "A-002", "member_id": " M-002 "},
+        ]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), {"can_enroll": True, "records": [
+            {"activity_id": "A-002", "member_id": "M-001", "remaining_seats": 0, "conflict_activity_ids": []},
+            {"activity_id": "A-002", "member_id": "M-002", "remaining_seats": 0, "conflict_activity_ids": []},
+        ]})
+        # A business obstacle is a successful call with can_enroll false.
+        blocked = run({"records": [
+            {"activity_id": "A-001", "member_id": "M-002"},
+            {"activity_id": "A-001", "member_id": "M-004"},
+        ]})
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(json.loads(blocked.stdout)["can_enroll"], False)
+        # An invalid group fails with error JSON and empty stdout.
+        bad = run({"records": [{"activity_id": "A-002", "member_id": "GHOST"}]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # Top-level array: independent previews; a later failure empties
+        # stdout and the error goes to stderr.
+        partial = run([
+            {"records": [{"activity_id": "A-003", "member_id": "M-001"}]},
+            {"records": []},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        # Nothing was ever written.
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.roster("A-002")["members"], [])
+
     def _split_ready(self):
         self.app.add_member("M-001", "小陈")
         self.app.add_member("M-002", "小林")

@@ -290,6 +290,34 @@ class ValidationTests(unittest.TestCase):
                 {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-003"},
             ])
 
+    def test_preview_enroll_also_rejects_broken_history(self):
+        # The preview runs the same whole-history validation: a valid group
+        # against a broken document fails with ValueError and leaves the bytes.
+        good_records = [{"activity_id": "A-002", "member_id": "M-002"}]
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.preview_enrollments(good_records)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken group (duplicate pair after normalization) fails argument
+        # validation before the filesystem is even touched.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.preview_enrollments([
+                {"activity_id": " A-002 ", "member_id": "M-002"},
+                {"activity_id": "A-002", "member_id": " M-002 "},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_preview_enroll_os_error_stays_an_os_error(self):
+        # data.json itself being a directory stays an operating-system error.
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.preview_enrollments([{"activity_id": "A-001", "member_id": "M-003"}])
+
     def test_split_activity_also_rejects_broken_history(self):
         # The split runs the same whole-history validation: a valid request
         # against a broken document fails with ValueError and leaves the bytes.
