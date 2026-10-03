@@ -3884,6 +3884,210 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _start_options_ready(self):
+        # 与 _absence_ready 相同的基础数据，另让小林 2026-10-15 完成入门二：
+        # 有效五天时小陈、小林在 2026-10-15 至 19 日均合格。
+        self._absence_ready()
+        self.app.record_completion("A-002", "M-002", "2026-10-15")
+
+    def test_absence_start_options_example(self):
+        self._start_options_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # 小林 17 日请假、期望一人，小陈申请两天：起日只能是 15 或 18 日，
+        # 请假者标识带首尾空白会先去除。
+        result = self.app.absence_start_options(
+            groups, "2026-10-15", "2026-10-19", 1,
+            [{"member_id": "M-002", "from_on": "2026-10-17", "to_on": "2026-10-17"}],
+            " M-001 ", 2)
+        self.assertEqual(result, {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-19",
+            "minimum_count": 1,
+            "member_id": "M-001",
+            "days": 2,
+            "start_windows": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-15"},
+                {"from_on": "2026-10-18", "to_on": "2026-10-18"},
+            ],
+        })
+
+    def test_absence_start_options_merging_and_no_deduction(self):
+        self._absence_ready()
+        # 小林 10-18 完成入门二：15 至 17 日小陈合格、18 至 20 日换成小林合格。
+        self.app.record_completion("A-002", "M-002", "2026-10-18")
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        # 小周从未合格，请假不扣人：每天可出勤人数都不变，连续可起日合并成
+        # 一个最长区间，即使 18 日合格名单由小陈换成小林也不拆分。
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-20", 1, [], "M-003", 2)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+
+    def test_absence_start_options_already_absent_and_shortage(self):
+        self._start_options_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # 本人当天已请假时不重复扣人：小陈 15 至 19 日均已请假，申请两天时
+        # 每天仍只有小林一人在岗，全部起日可行。
+        result = self.app.absence_start_options(
+            groups, "2026-10-15", "2026-10-19", 1,
+            [{"member_id": "M-001", "from_on": "2026-10-15", "to_on": "2026-10-19"}],
+            "M-001", 2)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-18"}])
+        # 期望两人时小陈请假使每天只剩小林一人：无可起日。
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 2, [], "M-001", 1)
+        self.assertEqual(result["start_windows"], [])
+
+    def test_absence_start_options_days_overflow_and_date_max(self):
+        self._start_options_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # days 超过查询天数时数组为空；等于查询天数时只有首日起得了。
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 6)
+        self.assertEqual(result["start_windows"], [])
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 5)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-15"}])
+        # 有效期长到溢出 date.max 时按整段合格处理；查询到 9999-12-31 也不溢出。
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 10**9}]
+        result = self.app.absence_start_options(groups, "9999-12-25", "9999-12-31", 1, [], "M-001", 3)
+        self.assertEqual(result["start_windows"], [{"from_on": "9999-12-25", "to_on": "9999-12-29"}])
+        result = self.app.absence_start_options(groups, "9999-12-25", "9999-12-31", 1, [], "M-001", 10**9)
+        self.assertEqual(result["start_windows"], [])
+        # 请假一直排到范围最后一天：其前的起日仍然可行，末日之后不再计算。
+        result = self.app.absence_start_options(
+            groups, "9999-12-30", "9999-12-31", 1,
+            [{"member_id": "M-002", "from_on": "9999-12-31", "to_on": "9999-12-31"}], "M-001", 1)
+        self.assertEqual(result["start_windows"], [{"from_on": "9999-12-30", "to_on": "9999-12-30"}])
+
+    def test_absence_start_options_rejections(self):
+        self._start_options_ready()
+        valid_groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        valid_absences = [{"member_id": "M-002", "from_on": "2026-10-17", "to_on": "2026-10-17"}]
+        # 缺少 member_id 或 days、标识空白或类型非法、days 非正整数或布尔均被拒绝。
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences)
+        for member_id in [None, " ", 123, ["M-001"]]:
+            with self.assertRaises(ValueError, msg=member_id):
+                self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences, member_id, 2)
+        for days in [None, 0, -1, True, "2", 2.0]:
+            with self.assertRaises(ValueError, msg=days):
+                self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences, "M-001", days)
+        # 未知成员、未入选的成员（包括空选择）均被拒绝。
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences, "GHOST", 2)
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences, "M-001", 2, ["M-002"])
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences, "M-001", 2, [])
+        # absences 省略或 null 拒绝，空数组合法；条目校验沿用拟请假预览。
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, None, "M-001", 2)
+        for absences in ["x", 1, {}]:
+            with self.assertRaises(ValueError, msg=absences):
+                self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, absences, "M-001", 2)
+        for absences in [[{}],
+                         [{"member_id": "M-001", "from_on": "2026-10-16"}],
+                         [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16", "extra": 1}],
+                         [{"member_id": "GHOST", "from_on": "2026-10-16", "to_on": "2026-10-16"}],
+                         [{"member_id": "M-001", "from_on": "2026-10-17", "to_on": "2026-10-16"}]]:
+            with self.assertRaises(ValueError, msg=absences):
+                self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, absences, "M-001", 2)
+        # 无可起日（days 超过查询天数）时仍校验全部输入：未知活动、未知成员。
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                "2026-10-15", "2026-10-19", 1, valid_absences, "M-001", 100)
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1,
+                                           [{"member_id": "GHOST", "from_on": "2026-11-01", "to_on": "2026-11-02"}],
+                                           "M-001", 100)
+        # 沿用拟请假预览的既有校验：分组、逆序范围、期望人数、成员选择去重。
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options([], "2026-10-15", "2026-10-19", 1, valid_absences, "M-001", 2)
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-20", "2026-10-19", 1, valid_absences, "M-001", 2)
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", True, valid_absences, "M-001", 2)
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(valid_groups, "2026-10-15", "2026-10-19", 1, valid_absences, "M-001", 2,
+                                           ["M-001", " M-001 "])
+
+    def test_absence_start_options_never_writes_and_legacy_data(self):
+        self._start_options_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        absences = [{"member_id": "M-002", "from_on": "2026-10-17", "to_on": "2026-10-17"}]
+        before = self.app.path.read_bytes()
+        self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, absences, "M-001", 2)
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, absences, "GHOST", 2)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 旧数据缺少 completions：按无记录处理，无人合格故无可起日，查询不补写该字段。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2)
+        self.assertEqual(result["start_windows"], [])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty-start-options"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, absences, "M-001", 2)
+        self.assertFalse(empty.exists())
+
+    def test_absence_start_options_broken_history_and_os_error(self):
+        self._start_options_ready()
+        groups = [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}]
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2)
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2)
+
+    def test_cli_absence_start_options_success_failure_and_partial_array(self):
+        self._start_options_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "absence-start-options", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"], "valid_days": 5}],
+                  "from_on": "2026-10-15", "to_on": "2026-10-19", "minimum_count": 1,
+                  "absences": [{"member_id": " M-002 ", "from_on": "2026-10-17", "to_on": "2026-10-17"}],
+                  "member_id": " M-001 ", "days": 2})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout), {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-19",
+            "minimum_count": 1,
+            "member_id": "M-001",
+            "days": 2,
+            "start_windows": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-15"},
+                {"from_on": "2026-10-18", "to_on": "2026-10-18"},
+            ],
+        })
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 5}],
+                   "from_on": "2026-10-15", "to_on": "2026-10-19", "minimum_count": 1,
+                   "absences": [], "member_id": "GHOST", "days": 2})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 5}],
+             "from_on": "2026-10-15", "to_on": "2026-10-19", "minimum_count": 1,
+             "absences": [], "member_id": "M-001", "days": 2},
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 5}],
+             "from_on": "2026-10-15", "to_on": "2026-10-19", "minimum_count": 1,
+             "absences": [], "member_id": "M-001", "days": 0},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
     def _renewal_ready(self):
         # 小陈 2026-10-15 在组内 A-001 完成、有效三天（10-18 到期）；组内另有
         # 10-17（窗口前）、10-19 满员且与本人两场同日活动冲突的 A-002、10-20 尚
