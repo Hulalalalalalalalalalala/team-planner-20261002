@@ -2774,5 +2774,204 @@ class ProductTests(unittest.TestCase):
         reopened = TeamPlanner(self.root)
         self.assertEqual([a["activity_id"] for a in reopened.activities()], ["A-001", "A-010"])
 
+    def _requirements_ready(self):
+        # 三个成员、五场活动：入门两场（10-10/10-11）、进阶两场（10-20/10-21，
+        # 相对截止日仍是未来活动）、同日补训两场（10-12）。
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "入门一", "2026-10-10", 3)
+        self.app.create_activity("A-002", "入门二", "2026-10-11", 3)
+        self.app.create_activity("A-003", "进阶一", "2026-10-20", 3)
+        self.app.create_activity("A-004", "进阶二", "2026-10-21", 3)
+        self.app.create_activity("A-005", "补训甲", "2026-10-12", 3)
+        self.app.create_activity("A-006", "补训乙", "2026-10-12", 3)
+        # 小陈：入门一已完成（10-15），进阶一已报名且完成日在截止日之后。
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-003", "M-001")
+        self.app.record_completion("A-001", "M-001", "2026-10-15")
+        self.app.record_completion("A-003", "M-001", "2026-10-20")
+        # 小林只报名入门二，无完成记录。
+        self.app.enroll("A-002", "M-002")
+        # 小周报名补训两场，两场同日完成，按活动标识选首条。
+        self.app.enroll("A-005", "M-003")
+        self.app.enroll("A-006", "M-003")
+        self.app.record_completion("A-005", "M-003", "2026-10-12")
+        self.app.record_completion("A-006", "M-003", "2026-10-12")
+
+    def test_training_requirements_statuses_counts_and_order(self):
+        self._requirements_ready()
+        result = self.app.training_requirements([
+            {"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]},
+            {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"]},
+            {"group_id": "G-EXTRA", "activity_ids": ["A-005", "A-006"]},
+        ], "2026-10-16")
+        self.assertEqual(result["as_of"], "2026-10-16")
+        self.assertEqual(result["required_count"], 3)
+        self.assertEqual([m["member_id"] for m in result["members"]], ["M-001", "M-002", "M-003"])
+        chen, lin, zhou = result["members"]
+        self.assertEqual(chen, {
+            "member_id": "M-001", "name": "小陈", "completed_count": 1, "remaining_count": 2,
+            "groups": [
+                {"group_id": "G-ENTRY", "status": "completed", "activity_id": "A-001", "completed_on": "2026-10-15"},
+                # 未来活动仍算要求；晚于截止日的记录不抵扣，但本人已报名，故为 pending。
+                {"group_id": "G-ADV", "status": "pending", "activity_id": None, "completed_on": None},
+                {"group_id": "G-EXTRA", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+            ],
+        })
+        self.assertEqual(lin, {
+            "member_id": "M-002", "name": "小林", "completed_count": 0, "remaining_count": 3,
+            "groups": [
+                {"group_id": "G-ENTRY", "status": "pending", "activity_id": None, "completed_on": None},
+                {"group_id": "G-ADV", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+                {"group_id": "G-EXTRA", "status": "not_enrolled", "activity_id": None, "completed_on": None},
+            ],
+        })
+        # 同日完成日期、同日活动日期时按活动标识升序选首条。
+        self.assertEqual(zhou["groups"][2], {"group_id": "G-EXTRA", "status": "completed", "activity_id": "A-005", "completed_on": "2026-10-12"})
+        self.assertEqual(zhou["completed_count"], 1)
+        self.assertEqual(zhou["remaining_count"], 2)
+
+    def test_training_requirements_first_qualifying_record_tie_breaks(self):
+        self._requirements_ready()
+        # 小林在入门两场都有合格记录：完成日期相同则取活动日期较早者。
+        self.app.enroll("A-001", "M-002")
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        self.app.record_completion("A-002", "M-002", "2026-10-15")
+        result = self.app.training_requirements(
+            [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"]}], "2026-10-16",
+            member_ids=["M-002"],
+        )
+        group = result["members"][0]["groups"][0]
+        self.assertEqual(group, {"group_id": "G-ENTRY", "status": "completed", "activity_id": "A-001", "completed_on": "2026-10-15"})
+        # 不同完成日期：较晚活动日期但完成日期更早的记录胜出。
+        self.app.correct_completions([{"activity_id": "A-001", "member_id": "M-002", "completed_on": "2026-10-16"}])
+        result = self.app.training_requirements(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]}], "2026-10-16", member_ids=["M-002"],
+        )
+        group = result["members"][0]["groups"][0]
+        self.assertEqual(group, {"group_id": "G-ENTRY", "status": "completed", "activity_id": "A-002", "completed_on": "2026-10-15"})
+        # 截止日当天计完成；再早一天则两条记录都过期，已报名故为 pending。
+        result = self.app.training_requirements(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]}], "2026-10-14", member_ids=["M-002"],
+        )
+        group = result["members"][0]["groups"][0]
+        self.assertEqual(group, {"group_id": "G-ENTRY", "status": "pending", "activity_id": None, "completed_on": None})
+
+    def test_training_requirements_member_selection_semantics(self):
+        self._requirements_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]}]
+        # 省略或 null：全员按标识升序。
+        self.assertEqual([m["member_id"] for m in self.app.training_requirements(groups, "2026-10-16")["members"]], ["M-001", "M-002", "M-003"])
+        self.assertEqual([m["member_id"] for m in self.app.training_requirements(groups, "2026-10-16", None)["members"]], ["M-001", "M-002", "M-003"])
+        # 显式给出：输入顺序，带空白先规范化。
+        result = self.app.training_requirements(groups, "2026-10-16", [" M-003 ", "M-001"])
+        self.assertEqual([m["member_id"] for m in result["members"]], ["M-003", "M-001"])
+        # 空数组：无人。
+        empty = self.app.training_requirements(groups, "2026-10-16", [])
+        self.assertEqual(empty, {"as_of": "2026-10-16", "required_count": 1, "members": []})
+
+    def test_training_requirements_rejections(self):
+        self._requirements_ready()
+        valid_groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]}]
+        for groups in [None, [], "x", [{}], [{"group_id": "G"}], [{"activity_ids": ["A-001"]}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "extra": 1}],
+                      [{"group_id": "  ", "activity_ids": ["A-001"]}],
+                      [{"group_id": 9, "activity_ids": ["A-001"]}],
+                      [{"group_id": "G", "activity_ids": None}],
+                      [{"group_id": "G", "activity_ids": []}],
+                      [{"group_id": "G", "activity_ids": ["A-001", " A-001 "]}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"]}, {"group_id": "G1", "activity_ids": ["A-002"]}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"]}, {"group_id": "G2", "activity_ids": ["A-001"]}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"]}, {"group_id": "G2", "activity_ids": ["GHOST"]}]]:
+            with self.assertRaises(ValueError, msg=groups):
+                self.app.training_requirements(groups, "2026-10-16")
+        for as_of in ["2026-02-30", " 2026-10-16", "2026/10/16", 20261016, None]:
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.training_requirements(valid_groups, as_of)
+        for member_ids in ["M-001", [" "], ["M-001", " M-001 "], ["M-001", "GHOST"]]:
+            with self.assertRaises(ValueError, msg=member_ids):
+                self.app.training_requirements(valid_groups, "2026-10-16", member_ids)
+
+    def test_training_requirements_other_members_and_unenrolled_records(self):
+        self._requirements_ready()
+        # 他人完成记录不影响本人：小林在入门二仍为 pending。
+        result = self.app.training_requirements(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]}], "2026-10-16", member_ids=["M-002", "M-001"],
+        )
+        by_member = {m["member_id"]: m for m in result["members"]}
+        self.assertEqual(by_member["M-002"]["groups"][0]["status"], "pending")
+        self.assertEqual(by_member["M-001"]["groups"][0]["status"], "completed")
+
+    def test_training_requirements_never_writes_and_legacy_data(self):
+        self._requirements_ready()
+        before = self.app.path.read_bytes()
+        self.app.training_requirements([{"group_id": "G", "activity_ids": ["A-001", "A-002"]}], "2026-10-16")
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.training_requirements([{"group_id": "G", "activity_ids": ["GHOST"]}], "2026-10-16")
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 旧数据缺少 completions：按无记录处理，按报名给 pending/not_enrolled。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.training_requirements(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"]},
+             {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"]}],
+            "2026-10-16", member_ids=["M-001", "M-002"],
+        )
+        self.assertEqual([g["status"] for g in result["members"][0]["groups"]], ["pending", "pending"])
+        self.assertEqual([g["status"] for g in result["members"][1]["groups"]], ["pending", "not_enrolled"])
+        # 查询不补写 completions 字段。
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.training_requirements([{"group_id": "G", "activity_ids": ["A-001"]}], "2026-10-16")
+        self.assertFalse(empty.exists())
+
+    def test_training_requirements_broken_history_and_os_error(self):
+        self._requirements_ready()
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.training_requirements([{"group_id": "G", "activity_ids": ["A-001"]}], "2026-10-16")
+        # data.json 是目录属于操作系统错误，保留 OSError。
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.training_requirements([{"group_id": "G", "activity_ids": ["A-001"]}], "2026-10-16")
+
+    def test_cli_training_requirements_success_failure_and_partial_array(self):
+        self._requirements_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "training-requirements", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"]}], "as_of": "2026-10-16", "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["required_count"], 1)
+        self.assertEqual(value["members"][0]["groups"], [
+            {"group_id": "G-ENTRY", "status": "completed", "activity_id": "A-001", "completed_on": "2026-10-15"},
+        ])
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["GHOST"]}], "as_of": "2026-10-16"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # 顶层数组：两次独立查询；第二个失败时标准输出为空。
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"]}], "as_of": "2026-10-16", "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["GHOST"]}], "as_of": "2026-10-16"},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
 if __name__ == "__main__":
     unittest.main()
