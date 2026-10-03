@@ -1090,6 +1090,110 @@ class TeamPlanner(JsonStore):
             })
         return {"as_of": as_of, "required_count": len(selected_activities), "members": rows}
 
+    def training_requirements(self, groups, as_of, member_ids=None):
+        # Read-only group reconciliation: completing any one activity of a
+        # group satisfies that requirement. Groups exist only for this query;
+        # they are never stored and never inferred from activity titles.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        entries = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids"}:
+                raise ValueError("each group must contain only group_id and activity_ids")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group ids must not contain duplicates")
+            seen_groups.add(group_id)
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            ids = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # An activity may appear only once in the whole request:
+                # neither repeated inside its group nor shared across groups.
+                if activity_id in seen_activities:
+                    raise ValueError("activity ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                ids.append(activity_id)
+            entries.append((group_id, ids))
+        as_of = day(as_of, "as_of")
+        # member_ids omitted or null means every member; an empty array means
+        # no members at all. Given ids are returned in input order.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        for _, ids in entries:
+            for activity_id in ids:
+                if activity_id not in activities:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        cutoff = date.fromisoformat(as_of)
+        rows = []
+        for member_id in ordered_member_ids:
+            group_rows = []
+            completed_count = 0
+            for group_id, ids in entries:
+                # Qualifying records: the member's own completions inside this
+                # group dated on or before the cutoff. Records after the
+                # cutoff never count; other members' records never count.
+                qualifying = []
+                enrolled = False
+                for activity_id in ids:
+                    activity = activities[activity_id]
+                    if member_id in activity.get("participants", []):
+                        enrolled = True
+                    completed_on = completions.get(activity_id, {}).get(member_id)
+                    if completed_on is not None and date.fromisoformat(completed_on) <= cutoff:
+                        qualifying.append((completed_on, activity["on"], activity_id))
+                if qualifying:
+                    # Several qualifying records: the earliest completion date
+                    # wins, then the earliest activity date, then the
+                    # identifier. The original record date is reported.
+                    completed_on, _, activity_id = min(qualifying)
+                    status = "completed"
+                    completed_count += 1
+                elif enrolled:
+                    # Enrolled in at least one activity of the group but no
+                    # qualifying record: still missing.
+                    status, activity_id, completed_on = "pending", None, None
+                else:
+                    status, activity_id, completed_on = "not_enrolled", None, None
+                group_rows.append({"group_id": group_id, "status": status, "activity_id": activity_id, "completed_on": completed_on})
+            rows.append({
+                "member_id": member_id,
+                "name": members[member_id]["name"],
+                "completed_count": completed_count,
+                # Future activities still count as requirements; every group
+                # without a qualifying record stays missing.
+                "remaining_count": len(entries) - completed_count,
+                "groups": group_rows,
+            })
+        return {"as_of": as_of, "required_count": len(entries), "members": rows}
+
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
             from_on = day(from_on, "from_on")
