@@ -1480,6 +1480,207 @@ class TeamPlanner(JsonStore):
                     })
         return {"as_of": as_of, "through_on": through_on, "alerts": alerts}
 
+    def training_renewal_options(self, groups, as_of, through_on, member_ids=None):
+        # Read-only alert view with renewal-session candidates: the alert
+        # selection, fields, statuses and ordering are exactly
+        # training_alerts', and each alert gains a candidates array using
+        # enrollment_options' fields and evaluation. Groups exist only for
+        # this call; both dates are explicit and the current date is never
+        # consulted.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        selected_groups = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids", "valid_days"}:
+                raise ValueError("each group must contain only group_id, activity_ids and valid_days")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group_ids must not contain duplicates")
+            seen_groups.add(group_id)
+            valid_days = positive(item["valid_days"], "valid_days")
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            group_activities = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # As in training_alerts, an activity belongs to exactly one
+                # group and may not repeat inside it.
+                if activity_id in seen_activities:
+                    raise ValueError("activity_ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                group_activities.append(activity_id)
+            selected_groups.append((group_id, group_activities, valid_days))
+        as_of = day(as_of, "as_of")
+        through_on = day(through_on, "through_on")
+        if through_on < as_of:
+            raise ValueError("through_on must be on or after as_of")
+        # member_ids follows training_alerts exactly: omitted or null means
+        # every member, an empty array means no members at all.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        for _, activity_ids, _ in selected_groups:
+            for activity_id in activity_ids:
+                if activities.get(activity_id) is None:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        cutoff = date.fromisoformat(as_of)
+        window_end = date.fromisoformat(through_on)
+        # A member's own current enrollments per date, gathered before the
+        # alert loop: completed trainings keep their seats (the participants
+        # lists already cover them), sessions in other groups count, and so do
+        # sessions hidden by the as_of/through window. Other members'
+        # enrollments never enter this map; they only affect remaining seats.
+        enrolled_on = {}
+        for activity_id, activity in activities.items():
+            participants = activity.get("participants", [])
+            on = activity.get("on")
+            for participant in participants:
+                enrolled_on.setdefault(participant, {}).setdefault(on, set()).add(activity_id)
+        alerts = []
+        for member_id in ordered_member_ids:
+            own_enrolled_on = enrolled_on.get(member_id, {})
+            for group_id, activity_ids, valid_days in selected_groups:
+                group_set = set(activity_ids)
+                # The qualifying record, enrollment fallback and same-day tie
+                # break are exactly training_alerts' selection.
+                candidates = []
+                enrolled_any = False
+                for activity_id in activity_ids:
+                    activity = activities[activity_id]
+                    if member_id in activity.get("participants", []):
+                        enrolled_any = True
+                    completed_on = completions.get(activity_id, {}).get(member_id)
+                    if (
+                        member_id in activity.get("participants", [])
+                        and completed_on is not None
+                        and date.fromisoformat(completed_on) <= cutoff
+                    ):
+                        candidates.append((completed_on, activity["on"], activity_id))
+                if candidates:
+                    latest_completed = max(candidate[0] for candidate in candidates)
+                    completed_on, _, selected_activity_id = min(
+                        candidate for candidate in candidates if candidate[0] == latest_completed
+                    )
+                    # As in training_alerts, an expiry past date.max is beyond
+                    # every possible window and produces no alert.
+                    try:
+                        expires = date.fromisoformat(completed_on) + timedelta(days=valid_days)
+                    except OverflowError:
+                        continue
+                    days_remaining = (expires - cutoff).days
+                    if expires <= cutoff:
+                        status = "expired"
+                    elif expires <= window_end:
+                        status = "expiring"
+                    else:
+                        # Still valid through the whole window: no alert.
+                        continue
+                    alert = {
+                        "member_id": member_id,
+                        "name": members[member_id]["name"],
+                        "group_id": group_id,
+                        "status": status,
+                        "activity_id": selected_activity_id,
+                        "completed_on": completed_on,
+                        "expires_on": expires.isoformat(),
+                        "days_remaining": days_remaining,
+                    }
+                elif enrolled_any:
+                    status = "pending"
+                    alert = {
+                        "member_id": member_id,
+                        "name": members[member_id]["name"],
+                        "group_id": group_id,
+                        "status": status,
+                        "activity_id": None,
+                        "completed_on": None,
+                        "expires_on": None,
+                        "days_remaining": None,
+                    }
+                else:
+                    status = "not_enrolled"
+                    alert = {
+                        "member_id": member_id,
+                        "name": members[member_id]["name"],
+                        "group_id": group_id,
+                        "status": status,
+                        "activity_id": None,
+                        "completed_on": None,
+                        "expires_on": None,
+                        "days_remaining": None,
+                    }
+                # Renewal sessions come only from this alert's group and
+                # exclude every activity the member is already enrolled in,
+                # so sessions of other groups and the member's own completed
+                # sessions are never candidates. Dates use the closed
+                # as_of..through_on window; expiring alerts additionally
+                # require a date strictly before expires_on, while expired,
+                # pending and not_enrolled alerts carry no expiry-date limit.
+                earliest_renewal = cutoff
+                latest_renewal = window_end
+                if status == "expiring":
+                    expiry_bound = expires - timedelta(days=1)
+                    if expiry_bound < latest_renewal:
+                        latest_renewal = expiry_bound
+                options = []
+                for activity_id in activity_ids:
+                    activity = activities[activity_id]
+                    if member_id in activity.get("participants", []):
+                        continue
+                    on = date.fromisoformat(activity["on"])
+                    if on < earliest_renewal or on > latest_renewal:
+                        continue
+                    # Completed enrollments occupy seats too, so remaining
+                    # seats use the whole current participant count; other
+                    # members' enrollments enter only here.
+                    remaining_seats = activity["capacity"] - len(activity.get("participants", []))
+                    # Conflicts are the member's own same-day enrollments in
+                    # other activities: other groups, completed sessions and
+                    # sessions outside the window all count. A candidate is
+                    # never among the member's own enrollments.
+                    conflicts = sorted(own_enrolled_on.get(activity["on"], ()))
+                    available = remaining_seats > 0 and not conflicts
+                    options.append({
+                        "activity_id": activity_id,
+                        "title": activity["title"],
+                        "on": activity["on"],
+                        "capacity": activity["capacity"],
+                        "remaining_seats": remaining_seats,
+                        "available": available,
+                        "conflict_activity_ids": conflicts,
+                    })
+                # Each candidate is judged independently: no seat is reserved
+                # and availability never claims several members could enroll
+                # together. Empty arrays stay attached to the alert.
+                alert["candidates"] = sorted(options, key=lambda r: (r["on"], r["activity_id"]))
+                alerts.append(alert)
+        return {"as_of": as_of, "through_on": through_on, "alerts": alerts}
+
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
             from_on = day(from_on, "from_on")

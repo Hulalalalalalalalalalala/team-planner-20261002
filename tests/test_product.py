@@ -3157,5 +3157,233 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _renewal_ready(self):
+        # 小陈 2026-10-15 在组内 A-001 完成、有效三天（10-18 到期）；组内另有
+        # 10-17（窗口前）、10-19 满员且与本人两场同日活动冲突的 A-002、10-20 尚
+        # 余一席的 A-003、10-21（窗口后）的场次。组外 A-100 是小陈当天已报名
+        # （未完成）的场次，A-101 是当天已完成的场次，两者都只应出现在冲突里。
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "入门一", "2026-10-15", 2)
+        self.app.create_activity("A-002", "十九号满员", "2026-10-19", 1)
+        self.app.create_activity("A-003", "二十号可选", "2026-10-20", 2)
+        self.app.create_activity("A-005", "窗口前", "2026-10-17", 2)
+        self.app.create_activity("A-006", "窗口后", "2026-10-21", 2)
+        self.app.create_activity("A-007", "廿二号", "2026-10-22", 2)
+        self.app.create_activity("A-100", "组外十九号", "2026-10-19", 2)
+        self.app.create_activity("A-101", "组外已完成", "2026-10-19", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.record_completion("A-001", "M-001", "2026-10-15")
+        self.app.enroll("A-002", "M-003")
+        self.app.enroll("A-003", "M-002")
+        self.app.enroll("A-100", "M-001")
+        self.app.enroll("A-101", "M-001")
+        self.app.record_completion("A-101", "M-001", "2026-10-19")
+
+    def _renewal_groups(self, valid_days=3):
+        return [{"group_id": "G-ENTRY",
+                 "activity_ids": ["A-001", "A-002", "A-003", "A-005", "A-006", "A-007"],
+                 "valid_days": valid_days}]
+
+    def test_renewal_options_expired_example_full_conflict_and_available(self):
+        self._renewal_ready()
+        result = self.app.training_renewal_options(self._renewal_groups(), "2026-10-18", "2026-10-20", ["M-001"])
+        self.assertEqual(result, {"as_of": "2026-10-18", "through_on": "2026-10-20", "alerts": [
+            {
+                "member_id": "M-001", "name": "小陈", "group_id": "G-ENTRY", "status": "expired",
+                "activity_id": "A-001", "completed_on": "2026-10-15",
+                "expires_on": "2026-10-18", "days_remaining": 0,
+                # 19 日场次满员（小周占去唯一席位）且与本人组外未完成的 A-100、
+                # 已完成的 A-101 同日冲突：两类阻碍同时展示；20 日场次余一席且
+                # 本人当天无任何报名，available 为 true。
+                "candidates": [
+                    {"activity_id": "A-002", "title": "十九号满员", "on": "2026-10-19", "capacity": 1,
+                     "remaining_seats": 0, "available": False, "conflict_activity_ids": ["A-100", "A-101"]},
+                    {"activity_id": "A-003", "title": "二十号可选", "on": "2026-10-20", "capacity": 2,
+                     "remaining_seats": 1, "available": True, "conflict_activity_ids": []},
+                ],
+            },
+        ]})
+
+    def test_renewal_options_keep_alert_fields_and_order_and_empty_candidates(self):
+        self._renewal_ready()
+        groups = self._renewal_groups()
+        alerts_only = self.app.training_alerts(groups, "2026-10-18", "2026-10-20")
+        with_options = self.app.training_renewal_options(groups, "2026-10-18", "2026-10-20")
+        self.assertEqual((with_options["as_of"], with_options["through_on"]),
+                         (alerts_only["as_of"], alerts_only["through_on"]))
+        # Outer order and every original alert field are preserved exactly.
+        self.assertEqual(len(with_options["alerts"]), len(alerts_only["alerts"]))
+        for enriched, plain in zip(with_options["alerts"], alerts_only["alerts"]):
+            self.assertTrue(enriched["candidates"] == [] or isinstance(enriched["candidates"], list))
+            self.assertEqual({k: v for k, v in enriched.items() if k != "candidates"}, plain)
+        order = [(a["member_id"], a["group_id"], a["status"]) for a in with_options["alerts"]]
+        # 小陈 expired；小林已报名 A-003 为 pending；小周已报名满员的 A-002 为 pending。
+        self.assertEqual(order, [("M-001", "G-ENTRY", "expired"),
+                                 ("M-002", "G-ENTRY", "pending"),
+                                 ("M-003", "G-ENTRY", "pending")])
+        lin, zhou = with_options["alerts"][1], with_options["alerts"][2]
+        self.assertEqual(lin["activity_id"], None)
+        self.assertEqual(lin["expires_on"], None)
+        # 小林本人 19 日无报名：满员只来自小周的席位，冲突数组为空，仍不可报名。
+        self.assertEqual(lin["candidates"], [
+            {"activity_id": "A-002", "title": "十九号满员", "on": "2026-10-19", "capacity": 1,
+             "remaining_seats": 0, "available": False, "conflict_activity_ids": []},
+        ])
+        # 小周已报名的 A-002 被排除；同一个余席对小周也独立显示为可报名，不预留席位。
+        self.assertEqual(zhou["candidates"], [
+            {"activity_id": "A-003", "title": "二十号可选", "on": "2026-10-20", "capacity": 2,
+             "remaining_seats": 1, "available": True, "conflict_activity_ids": []},
+        ])
+
+    def test_renewal_options_candidates_stay_inside_group(self):
+        self._renewal_ready()
+        # 第二个组只含小陈组外的两场 19 日活动（一场待完成、一场已完成）：候选
+        # 只能来自本组，G-ENTRY 的场次绝不泄漏；本人已报名场次全部排除，故候选
+        # 为空数组，但 pending 提醒保留。
+        groups = self._renewal_groups() + [
+            {"group_id": "G-OTHER", "activity_ids": ["A-100", "A-101"], "valid_days": 30},
+        ]
+        result = self.app.training_renewal_options(groups, "2026-10-18", "2026-10-20", ["M-001"])
+        self.assertEqual([(a["group_id"], a["status"]) for a in result["alerts"]],
+                         [("G-ENTRY", "expired"), ("G-OTHER", "pending")])
+        self.assertEqual(result["alerts"][1]["candidates"], [])
+
+    def test_renewal_options_expiring_requires_date_before_expiry(self):
+        self.app.add_member("M-004", "小吴")
+        self.app.create_activity("B-001", "上周培训", "2026-10-16", 2)
+        self.app.create_activity("B-002", "二十号复训", "2026-10-20", 2)
+        self.app.create_activity("B-003", "到期日复训", "2026-10-21", 2)
+        self.app.create_activity("B-004", "到期后复训", "2026-10-22", 2)
+        self.app.enroll("B-001", "M-004")
+        self.app.record_completion("B-001", "M-004", "2026-10-16")
+        groups = [{"group_id": "G-B", "activity_ids": ["B-001", "B-002", "B-003", "B-004"], "valid_days": 5}]
+        # 10-16 完成、有效五天：10-21 到期；10-18 查至 10-25 为 expiring。
+        result = self.app.training_renewal_options(groups, "2026-10-18", "2026-10-25", ["M-004"])
+        alert = result["alerts"][0]
+        self.assertEqual(alert["status"], "expiring")
+        self.assertEqual(alert["expires_on"], "2026-10-21")
+        self.assertEqual(alert["days_remaining"], 3)
+        # expiring 的候选日期必须严格早于到期日：到期日当天 10-21 与之后的场次
+        # 即使落在查询窗口内也排除，窗口内 10-20 的场次保留。
+        self.assertEqual([c["activity_id"] for c in alert["candidates"]], ["B-002"])
+
+    def test_renewal_options_expired_has_no_expiry_upper_bound(self):
+        self._renewal_ready()
+        # expired 状态不加到期日限制：查至 10-25 时到期日之后的 10-21、10-22
+        # 组内场次同样作为候选，按日期与标识升序。
+        result = self.app.training_renewal_options(self._renewal_groups(), "2026-10-18", "2026-10-25", ["M-001"])
+        alert = result["alerts"][0]
+        self.assertEqual(alert["status"], "expired")
+        self.assertEqual([c["activity_id"] for c in alert["candidates"]],
+                         ["A-002", "A-003", "A-006", "A-007"])
+        for candidate in alert["candidates"]:
+            self.assertEqual(candidate["available"], candidate["remaining_seats"] > 0)
+
+    def test_renewal_options_valid_group_produces_no_alert_and_empty_selection_validates(self):
+        self._renewal_ready()
+        groups = self._renewal_groups(valid_days=30)
+        # 有效期 30 天：小陈 10-15 完成后在整个窗口内仍然有效，无提醒；小林、小周
+        # 无合格记录仍各有一条提醒。
+        result = self.app.training_renewal_options(groups, "2026-10-18", "2026-10-20", ["M-001"])
+        self.assertEqual(result, {"as_of": "2026-10-18", "through_on": "2026-10-20", "alerts": []})
+        # 成员选择为空数组时 alerts 为空，但全部输入引用仍须校验。
+        empty = self.app.training_renewal_options(groups, "2026-10-18", "2026-10-20", [])
+        self.assertEqual(empty["alerts"], [])
+        with self.assertRaises(ValueError):
+            self.app.training_renewal_options(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "2026-10-18", "2026-10-20", [])
+
+    def test_renewal_options_rejections_match_alerts(self):
+        self._renewal_ready()
+        valid_groups = self._renewal_groups()
+        for groups in [None, [], "x", [{}],
+                      [{"group_id": "G", "activity_ids": ["A-001"]}],
+                      [{"group_id": "G", "valid_days": 3}],
+                      [{"activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "extra": 1}],
+                      [{"group_id": "  ", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": None, "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": [], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001", " A-001 "], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": True}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 0}],
+                      [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                      valid_groups + [{"group_id": "G2", "activity_ids": ["A-001"], "valid_days": 3}]]:
+            with self.assertRaises(ValueError, msg=groups):
+                self.app.training_renewal_options(groups, "2026-10-18", "2026-10-20")
+        for as_of, through_on in [("2026-02-30", "2026-10-20"), (" 2026-10-18", "2026-10-20"),
+                                  ("2026-10-21", "2026-10-20"), ("2026-10-18", None)]:
+            with self.assertRaises(ValueError, msg=(as_of, through_on)):
+                self.app.training_renewal_options(valid_groups, as_of, through_on)
+        for member_ids in ["M-001", [" "], ["M-001", " M-001 "], ["M-001", "GHOST"]]:
+            with self.assertRaises(ValueError, msg=member_ids):
+                self.app.training_renewal_options(valid_groups, "2026-10-18", "2026-10-20", member_ids)
+
+    def test_renewal_options_never_writes_legacy_and_broken_history(self):
+        self._renewal_ready()
+        before = self.app.path.read_bytes()
+        self.app.training_renewal_options(self._renewal_groups(), "2026-10-18", "2026-10-20")
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.training_renewal_options(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}], "2026-10-18", "2026-10-20")
+        self.assertEqual(before, self.app.path.read_bytes())
+        # Legacy data without completions: every enrollment is pending and the
+        # groups are still evaluated for candidates.
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        legacy = self.app.training_renewal_options(self._renewal_groups(), "2026-10-18", "2026-10-20")
+        self.assertEqual([a["status"] for a in legacy["alerts"]], ["pending", "pending", "pending"])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # Broken history is rejected wholesale and a read OSError stays an OSError.
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.training_renewal_options(self._renewal_groups(), "2026-10-18", "2026-10-20")
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.training_renewal_options(self._renewal_groups(), "2026-10-18", "2026-10-20")
+        # A query against a missing directory neither creates it nor writes a file.
+        empty = self.root / "empty-renewal"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.training_renewal_options(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-18", "2026-10-20")
+        self.assertFalse(empty.exists())
+
+    def test_cli_renewal_options_success_failure_and_partial_array(self):
+        self._renewal_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "renewal-options", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": self._renewal_groups(), "as_of": "2026-10-18", "through_on": "2026-10-20", "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["as_of"], "2026-10-18")
+        self.assertEqual(value["alerts"][0]["status"], "expired")
+        self.assertEqual([c["activity_id"] for c in value["alerts"][0]["candidates"]], ["A-002", "A-003"])
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                   "as_of": "2026-10-18", "through_on": "2026-10-20"})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([
+            {"groups": self._renewal_groups(), "as_of": "2026-10-18", "through_on": "2026-10-20", "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+             "as_of": "2026-10-18", "through_on": "2026-10-20"},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
 if __name__ == "__main__":
     unittest.main()
