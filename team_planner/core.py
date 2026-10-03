@@ -103,6 +103,76 @@ class TeamPlanner(JsonStore):
         # named by several entries reflects the final roster after the group.
         return [activities[activity_id] for activity_id, _ in entries]
 
+    def preview_enrollments(self, records):
+        # Read-only preview of enroll_batch: the same normalization and
+        # validation, but nothing is ever written back and no missing
+        # directory or file is created.
+        if not isinstance(records, list) or not records:
+            raise ValueError("records must be a nonempty array")
+        entries = []
+        seen = set()
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {"activity_id", "member_id"}:
+                raise ValueError("each record must contain only activity_id and member_id")
+            activity_id = text(item["activity_id"], "activity_id")
+            member_id = text(item["member_id"], "member_id")
+            pair = (activity_id, member_id)
+            if pair in seen:
+                raise ValueError("records must not contain duplicate activity and member pairs")
+            seen.add(pair)
+            entries.append((activity_id, member_id))
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        # Structural errors reject the preview outright, exactly as in the
+        # mutating batch: unknown activity or member, or an existing
+        # enrollment of the member in the activity.
+        for activity_id, member_id in entries:
+            activity = activities.get(activity_id)
+            if activity is None or member_id not in members:
+                raise ValueError("unknown activity or member")
+            if member_id in activity["participants"]:
+                raise ValueError("member already enrolled")
+        # Remaining seats are judged on the final rosters: the original list
+        # plus every new enrollment of this group. Completed enrollments keep
+        # their seats, so the participants lists already cover them; an
+        # overbooked activity keeps its negative count, and every entry
+        # naming the same activity reports the same number.
+        delta = {}
+        for activity_id, _ in entries:
+            delta[activity_id] = delta.get(activity_id, 0) + 1
+        remaining = {
+            activity_id: activities[activity_id]["capacity"] - (len(activities[activity_id].get("participants", [])) + change)
+            for activity_id, change in delta.items()
+        }
+        # Conflicts use the final enrollments too: the member's existing
+        # enrollments on the target date (completed ones still count) plus
+        # the other activities this group joins them to on that date, always
+        # excluding the entry's own target. Other members' enrollments and
+        # other dates never count.
+        joining = {}
+        for activity_id, member_id in entries:
+            joining.setdefault(member_id, {}).setdefault(activities[activity_id]["on"], set()).add(activity_id)
+        preview = []
+        for activity_id, member_id in entries:
+            on = activities[activity_id]["on"]
+            conflicts = set(joining[member_id][on])
+            conflicts.discard(activity_id)
+            for other_id, other in activities.items():
+                if other_id != activity_id and other.get("on") == on and member_id in other.get("participants", []):
+                    conflicts.add(other_id)
+            preview.append({
+                "activity_id": activity_id,
+                "member_id": member_id,
+                "remaining_seats": remaining[activity_id],
+                "conflict_activity_ids": sorted(conflicts),
+            })
+        # Both kinds of obstacles are reported together; only a group where
+        # every entry keeps a nonnegative seat count and no same-day conflict
+        # can be enrolled as submitted.
+        can_enroll = all(item["remaining_seats"] >= 0 and not item["conflict_activity_ids"] for item in preview)
+        return {"can_enroll": can_enroll, "records": preview}
+
     def transfer_enrollment(self, source_activity_id, target_activity_id, member_id):
         source_activity_id = text(source_activity_id, "source_activity_id")
         target_activity_id = text(target_activity_id, "target_activity_id")
