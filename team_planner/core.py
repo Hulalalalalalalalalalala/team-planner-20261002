@@ -1,5 +1,5 @@
 import csv
-from datetime import date
+from datetime import date, timedelta
 import io
 import json
 from .storage import JsonStore, text, positive, day
@@ -1333,6 +1333,152 @@ class TeamPlanner(JsonStore):
                 "groups": group_rows,
             })
         return {"as_of": as_of, "required_count": len(selected_groups), "members": rows}
+
+    def training_alerts(self, groups, as_of, through_on, member_ids=None):
+        # Read-only alert view over the same ephemeral training groups as
+        # training_validity: the record picked per member and group follows the
+        # exact same rules, so future records never participate or mask older
+        # ones. Both window dates are explicit; the current date is never
+        # consulted, and an expiry past 9999-12-31 is simply outside the
+        # window rather than an overflow error.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        selected_groups = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids", "valid_days"}:
+                raise ValueError("each group must contain only group_id, activity_ids and valid_days")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group_ids must not contain duplicates")
+            seen_groups.add(group_id)
+            valid_days = positive(item["valid_days"], "valid_days")
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            group_activities = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # As in training_validity, an activity belongs to exactly one
+                # group and may not repeat inside it.
+                if activity_id in seen_activities:
+                    raise ValueError("activity_ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                group_activities.append(activity_id)
+            selected_groups.append((group_id, group_activities, valid_days))
+        as_of = day(as_of, "as_of")
+        through_on = day(through_on, "through_on")
+        if through_on < as_of:
+            raise ValueError("through_on must be on or after as_of")
+        # member_ids follows training_validity exactly: omitted or null means
+        # every member, an empty array means no members at all.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        for _, activity_ids, _ in selected_groups:
+            for activity_id in activity_ids:
+                if activities.get(activity_id) is None:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        cutoff = date.fromisoformat(as_of)
+        window_end = date.fromisoformat(through_on)
+        alerts = []
+        for member_id in ordered_member_ids:
+            for group_id, activity_ids, valid_days in selected_groups:
+                # The qualifying record, enrollment fallback and same-day tie
+                # break are exactly training_validity's selection.
+                candidates = []
+                enrolled_any = False
+                for activity_id in activity_ids:
+                    activity = activities[activity_id]
+                    if member_id in activity.get("participants", []):
+                        enrolled_any = True
+                    completed_on = completions.get(activity_id, {}).get(member_id)
+                    if (
+                        member_id in activity.get("participants", [])
+                        and completed_on is not None
+                        and date.fromisoformat(completed_on) <= cutoff
+                    ):
+                        candidates.append((completed_on, activity["on"], activity_id))
+                if candidates:
+                    latest_completed = max(candidate[0] for candidate in candidates)
+                    completed_on, _, activity_id = min(
+                        candidate for candidate in candidates if candidate[0] == latest_completed
+                    )
+                    # The expiry is the completion day plus valid_days calendar
+                    # days. A result past date.max is beyond every possible
+                    # window end, so it is treated as out of window instead of
+                    # raising; timedelta itself also rejects huge day counts.
+                    try:
+                        expires = date.fromisoformat(completed_on) + timedelta(days=valid_days)
+                    except OverflowError:
+                        continue
+                    days_remaining = (expires - cutoff).days
+                    if expires <= cutoff:
+                        status = "expired"
+                    elif expires <= window_end:
+                        status = "expiring"
+                    else:
+                        # Still valid through the whole window: no alert.
+                        continue
+                    alerts.append({
+                        "member_id": member_id,
+                        "name": members[member_id]["name"],
+                        "group_id": group_id,
+                        "status": status,
+                        "activity_id": activity_id,
+                        "completed_on": completed_on,
+                        "expires_on": expires.isoformat(),
+                        "days_remaining": days_remaining,
+                    })
+                elif enrolled_any:
+                    # Enrolled in at least one session without an eligible
+                    # record: pending; not enrolling any session is a separate
+                    # alert, and both are kept.
+                    alerts.append({
+                        "member_id": member_id,
+                        "name": members[member_id]["name"],
+                        "group_id": group_id,
+                        "status": "pending",
+                        "activity_id": None,
+                        "completed_on": None,
+                        "expires_on": None,
+                        "days_remaining": None,
+                    })
+                else:
+                    alerts.append({
+                        "member_id": member_id,
+                        "name": members[member_id]["name"],
+                        "group_id": group_id,
+                        "status": "not_enrolled",
+                        "activity_id": None,
+                        "completed_on": None,
+                        "expires_on": None,
+                        "days_remaining": None,
+                    })
+        return {"as_of": as_of, "through_on": through_on, "alerts": alerts}
 
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
