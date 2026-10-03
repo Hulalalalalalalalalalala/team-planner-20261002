@@ -320,6 +320,33 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.app.split_activity("A-001", "A-101", "进阶", "2026-10-15", 1, ["M-002"])
 
+    def test_merge_activities_also_rejects_broken_history(self):
+        # The merge runs the same whole-history validation: a feasible request
+        # against a broken document fails with ValueError and leaves the bytes.
+        # A-003 (capacity 2, only M-001) absorbs A-001's M-002 without overflow;
+        # the document below is broken via M-002's blank name instead.
+        good = {"target_activity_id": "A-003", "source_activity_ids": ["A-001"]}
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.merge_activities(**good)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken request (duplicate source after normalization) fails
+        # argument validation before the filesystem is even touched.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.merge_activities("A-003", ["A-001", " A-001 "])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_merge_activities_os_error_stays_an_os_error(self):
+        # data.json itself being a directory stays an operating-system error.
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.merge_activities("A-001", ["A-002"])
+
     def test_unrelated_broken_record_is_not_hidden_by_filters(self):
         # Querying M-001's own data must still fail because of M-002's broken
         # profile and A-002's broken completion record.
