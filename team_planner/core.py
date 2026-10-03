@@ -103,6 +103,73 @@ class TeamPlanner(JsonStore):
         # named by several entries reflects the final roster after the group.
         return [activities[activity_id] for activity_id, _ in entries]
 
+    def split_activity(self, source_activity_id, activity_id, title, on, capacity, member_ids):
+        # Creation and enrollment transfer take effect together: every input is
+        # normalized and every condition is checked before the new activity is
+        # inserted or any participant list is touched.
+        source_activity_id = text(source_activity_id, "source_activity_id")
+        activity_id = text(activity_id, "activity_id")
+        title = text(title, "title")
+        on = day(on, "on")
+        capacity = positive(capacity, "capacity")
+        if not isinstance(member_ids, list) or not member_ids:
+            raise ValueError("member_ids must be a nonempty array")
+        selected = []
+        seen = set()
+        for member_id in member_ids:
+            member_id = text(member_id, "member_id")
+            if member_id in seen:
+                raise ValueError("member_ids must not contain duplicate member ids")
+            seen.add(member_id)
+            selected.append(member_id)
+        if capacity < len(selected):
+            raise ValueError("capacity must not be less than the number of moved members")
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        source = activities.get(source_activity_id)
+        if source is None:
+            raise ValueError("unknown activity")
+        if activity_id in activities:
+            raise ValueError("activity already exists")
+        completions = data.get("completions", {})
+        # The source and every selected member must exist, each member must be
+        # enrolled in the source, and none may have an own completion record for
+        # it. Other members' records never block the split; records are never
+        # deleted or migrated.
+        for member_id in selected:
+            if member_id not in members:
+                raise ValueError("unknown member")
+            if member_id not in source.get("participants", []):
+                raise ValueError("member is not enrolled in the source activity")
+            if member_id in completions.get(source_activity_id, {}):
+                raise ValueError("member has a completion record for the source activity")
+        # A moved member must not keep a seat in a third activity on the new
+        # date. The source is excluded, so splitting onto the same day is fine;
+        # the new activity does not exist yet. Completed enrollments still
+        # count, and unrelated members or historical conflicts on other dates
+        # never block the split.
+        for other_id, other in activities.items():
+            if other_id == source_activity_id or other.get("on") != on:
+                continue
+            if seen & set(other.get("participants", [])):
+                raise ValueError("member is enrolled in another activity on that date")
+        # The new activity holds only the standard fields and starts without
+        # completion records; its roster follows the member input order. The
+        # source keeps every other field and the relative order of the members
+        # who stay; an emptied roster is still kept.
+        new_activity = {
+            "activity_id": activity_id,
+            "title": title,
+            "on": on,
+            "capacity": capacity,
+            "participants": list(selected),
+        }
+        activities[activity_id] = new_activity
+        source["participants"] = [member_id for member_id in source["participants"] if member_id not in seen]
+        self._write(data)
+        return {"source_activity": source, "new_activity": new_activity}
+
     def transfer_enrollment(self, source_activity_id, target_activity_id, member_id):
         source_activity_id = text(source_activity_id, "source_activity_id")
         target_activity_id = text(target_activity_id, "target_activity_id")
