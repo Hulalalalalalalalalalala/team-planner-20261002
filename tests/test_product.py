@@ -3387,6 +3387,284 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _coverage_ready(self):
+        # 与 _timeline_ready 相同的基础数据，供培训合格人数核对使用。
+        self._timeline_ready()
+
+    def test_training_coverage_example_and_all_groups_required(self):
+        self._coverage_ready()
+        # 需求示例：只选小陈、期望两人，他唯一的组 2026-10-15 完成且有效三天、
+        # 无其他记录：15 至 17 日合格 1 人、欠缺 1 人，18 日起合格 0 人、欠缺 2 人。
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        result = self.app.training_coverage(groups, "2026-10-15", "2026-10-18", 2, ["M-001"])
+        self.assertEqual(result, {
+            "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 2,
+            "periods": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-17",
+                 "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 1},
+                {"from_on": "2026-10-18", "to_on": "2026-10-18",
+                 "valid_member_ids": [], "valid_count": 0, "shortage_count": 2},
+            ],
+        })
+        # 只有当天所有组都 valid 才算合格：小陈进阶组记录在 10-20，10-15 至 10-17
+        # 入门组有效但进阶组尚无合格记录，整段无人合格。
+        both = self.app.training_coverage(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3},
+             {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"], "valid_days": 5}],
+            "2026-10-15", "2026-10-19", 1, ["M-001"])
+        self.assertEqual(both["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-19",
+             "valid_member_ids": [], "valid_count": 0, "shortage_count": 1},
+        ])
+        # 入门组有效期放宽到十天：小陈 15 至 24 日入门有效、20 至 24 日进阶有效，
+        # 仅两组同时有效的 20 至 24 日合格；进阶记录在完成日前不提前生效。
+        both = self.app.training_coverage(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 10},
+             {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"], "valid_days": 5}],
+            "2026-10-14", "2026-10-26", 1, ["M-001"])
+        self.assertEqual(both["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-19",
+             "valid_member_ids": [], "valid_count": 0, "shortage_count": 1},
+            {"from_on": "2026-10-20", "to_on": "2026-10-24",
+             "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-25", "to_on": "2026-10-26",
+             "valid_member_ids": [], "valid_count": 0, "shortage_count": 1},
+        ])
+
+    def test_training_coverage_personnel_change_splits_basis_change_does_not(self):
+        self._coverage_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        # 小林 10-18 完成入门二：人数同为 1 但人员替换，必须分段。
+        self.app.record_completion("A-002", "M-002", "2026-10-18")
+        result = self.app.training_coverage(groups, "2026-10-15", "2026-10-20", 1)
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-17",
+             "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-18", "to_on": "2026-10-20",
+             "valid_member_ids": ["M-002"], "valid_count": 1, "shortage_count": 0},
+        ])
+        # 小陈 10-18 在入门二再完成一场：完成依据改变但合格人员不变，不分段。
+        self.app.enroll("A-002", "M-001")
+        self.app.record_completion("A-002", "M-001", "2026-10-18")
+        result = self.app.training_coverage(groups, "2026-10-15", "2026-10-20", 1, ["M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-20",
+             "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 0},
+        ])
+
+    def test_training_coverage_matches_daily_validity_and_covers_closed_range(self):
+        self._coverage_ready()
+        groups = [
+            {"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3},
+            {"group_id": "G-ADV", "activity_ids": ["A-003", "A-004"], "valid_days": 5},
+            {"group_id": "G-EXTRA", "activity_ids": ["A-005", "A-006"], "valid_days": 30},
+        ]
+        result = self.app.training_coverage(groups, "2026-10-10", "2026-10-26", 2)
+        self.assertEqual(result["from_on"], "2026-10-10")
+        self.assertEqual(result["to_on"], "2026-10-26")
+        self.assertEqual(result["minimum_count"], 2)
+        periods = result["periods"]
+        # 区间闭区间相接、完整覆盖查询范围且无重叠，按起日升序；相邻区间
+        # 合格名单绝不相同：合并是最长的。
+        self.assertEqual(periods[0]["from_on"], "2026-10-10")
+        self.assertEqual(periods[-1]["to_on"], "2026-10-26")
+        for earlier, later in zip(periods, periods[1:]):
+            self.assertEqual(
+                date.fromisoformat(earlier["to_on"]) + timedelta(days=1),
+                date.fromisoformat(later["from_on"]),
+            )
+            self.assertNotEqual(earlier["valid_member_ids"], later["valid_member_ids"])
+        for period in periods:
+            self.assertEqual(period["valid_count"], len(period["valid_member_ids"]))
+            self.assertEqual(period["shortage_count"], max(0, 2 - period["valid_count"]))
+        # 每一天的合格名单与当日 training-validity 全部组均为 valid 的成员一致。
+        day = date(2026, 10, 10)
+        while day <= date(2026, 10, 26):
+            daily = self.app.training_validity(groups, day.isoformat())
+            expected = [
+                member["member_id"] for member in daily["members"]
+                if all(group["status"] == "valid" for group in member["groups"])
+            ]
+            period = next(p for p in periods if p["from_on"] <= day.isoformat() <= p["to_on"])
+            self.assertEqual(period["valid_member_ids"], expected)
+            day += timedelta(days=1)
+
+    def test_training_coverage_member_selection_order_empty_and_single_day(self):
+        self._coverage_ready()
+        # 小林 10-16 完成入门二：16 至 17 日小陈、小林同时合格，名单按成员选择
+        # 顺序排列（标识带首尾空白先去除），不按标识排序。
+        self.app.record_completion("A-002", "M-002", "2026-10-16")
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        result = self.app.training_coverage(groups, "2026-10-16", "2026-10-17", 3, [" M-002 ", "M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-16", "to_on": "2026-10-17",
+             "valid_member_ids": ["M-002", "M-001"], "valid_count": 2, "shortage_count": 1},
+        ])
+        # 成员选择为空数组：仍返回一个覆盖全范围的区间，人数为零且欠缺数等于
+        # 期望人数；全部引用仍然校验。
+        empty = self.app.training_coverage(groups, "2026-10-16", "2026-10-17", 3, [])
+        self.assertEqual(empty, {
+            "from_on": "2026-10-16", "to_on": "2026-10-17", "minimum_count": 3,
+            "periods": [
+                {"from_on": "2026-10-16", "to_on": "2026-10-17",
+                 "valid_member_ids": [], "valid_count": 0, "shortage_count": 3},
+            ],
+        })
+        with self.assertRaises(ValueError):
+            self.app.training_coverage(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                "2026-10-16", "2026-10-17", 1, [])
+        # 起止相等表示查询一天：单个一日区间。
+        single = self.app.training_coverage(groups, "2026-10-15", "2026-10-15", 1, ["M-001"])
+        self.assertEqual(single["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15",
+             "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 0},
+        ])
+
+    def test_training_coverage_validity_beyond_date_max(self):
+        self._coverage_ready()
+        # 有效期越过 9999-12-31：只按查询范围给出人数，不报溢出错误。
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001"], "valid_days": 10 ** 12}]
+        result = self.app.training_coverage(groups, "2026-10-14", "2026-10-20", 1, ["M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-14",
+             "valid_member_ids": [], "valid_count": 0, "shortage_count": 1},
+            {"from_on": "2026-10-15", "to_on": "2026-10-20",
+             "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 0},
+        ])
+        # 查询范围止于 9999-12-31 本身也不报溢出错误。
+        edge = self.app.training_coverage(groups, "9999-12-31", "9999-12-31", 1, ["M-001"])
+        self.assertEqual(edge["periods"], [
+            {"from_on": "9999-12-31", "to_on": "9999-12-31",
+             "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 0},
+        ])
+
+    def test_training_coverage_rejections(self):
+        self._coverage_ready()
+        valid_groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        for groups in [None, [], "x", [{}],
+                      [{"group_id": "G", "activity_ids": ["A-001"]}],
+                      [{"group_id": "G", "valid_days": 3}],
+                      [{"activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "extra": 1}],
+                      [{"group_id": "  ", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": None, "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": [], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001", " A-001 "], "valid_days": 3}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": True}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 0}],
+                      [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": "3"}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"], "valid_days": 3},
+                       {"group_id": "G1", "activity_ids": ["A-002"], "valid_days": 3}],
+                      [{"group_id": "G1", "activity_ids": ["A-001"], "valid_days": 3},
+                       {"group_id": "G2", "activity_ids": ["A-001"], "valid_days": 3}],
+                      [{"group_id": "G1", "activity_ids": ["GHOST"], "valid_days": 3}]]:
+            with self.assertRaises(ValueError, msg=groups):
+                self.app.training_coverage(groups, "2026-10-14", "2026-10-19", 1)
+        for from_on, to_on in [("2026-02-30", "2026-10-19"), (" 2026-10-14", "2026-10-19"),
+                               ("2026-10-14", "2026/10/19"), (20261014, "2026-10-19"),
+                               ("2026-10-14", None), ("2026-10-20", "2026-10-19")]:
+            with self.assertRaises(ValueError, msg=(from_on, to_on)):
+                self.app.training_coverage(valid_groups, from_on, to_on, 1)
+        # 期望人数必须是非布尔的正整数，允许超过选中成员数。
+        for minimum_count in [None, True, 0, -1, "2", 2.5]:
+            with self.assertRaises(ValueError, msg=minimum_count):
+                self.app.training_coverage(valid_groups, "2026-10-14", "2026-10-19", minimum_count)
+        for member_ids in ["M-001", [" "], ["M-001", " M-001 "], ["M-001", "GHOST"]]:
+            with self.assertRaises(ValueError, msg=member_ids):
+                self.app.training_coverage(valid_groups, "2026-10-14", "2026-10-19", 1, member_ids)
+
+    def test_training_coverage_never_writes_and_legacy_data(self):
+        self._coverage_ready()
+        before = self.app.path.read_bytes()
+        self.app.training_coverage(
+            [{"group_id": "G", "activity_ids": ["A-001", "A-002"], "valid_days": 3}],
+            "2026-10-14", "2026-10-19", 2)
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.training_coverage(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                "2026-10-14", "2026-10-19", 2)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 旧数据缺少 completions：按无记录处理，查询不补写该字段。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.training_coverage(
+            [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}],
+            "2026-10-14", "2026-10-19", 2)
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-19",
+             "valid_member_ids": [], "valid_count": 0, "shortage_count": 2},
+        ])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty-coverage"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.training_coverage(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+                "2026-10-14", "2026-10-19", 1)
+        self.assertFalse(empty.exists())
+
+    def test_training_coverage_broken_history_and_os_error(self):
+        self._coverage_ready()
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.training_coverage(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+                "2026-10-14", "2026-10-19", 1)
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.training_coverage(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+                "2026-10-14", "2026-10-19", 1)
+
+    def test_cli_training_coverage_success_failure_and_partial_array(self):
+        self._coverage_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "training-coverage", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"], "valid_days": 3}],
+                  "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 2, "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value, {
+            "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 2,
+            "periods": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-17",
+                 "valid_member_ids": ["M-001"], "valid_count": 1, "shortage_count": 1},
+                {"from_on": "2026-10-18", "to_on": "2026-10-18",
+                 "valid_member_ids": [], "valid_count": 0, "shortage_count": 2},
+            ],
+        })
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                   "from_on": "2026-10-14", "to_on": "2026-10-19", "minimum_count": 1})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        missing = run({"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+                       "from_on": "2026-10-14", "to_on": "2026-10-19"})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stderr))
+        self.assertEqual(missing.stdout, "")
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+             "from_on": "2026-10-14", "to_on": "2026-10-19", "minimum_count": 1, "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+             "from_on": "2026-10-14", "to_on": "2026-10-19", "minimum_count": 1},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
     def _renewal_ready(self):
         # 小陈 2026-10-15 在组内 A-001 完成、有效三天（10-18 到期）；组内另有
         # 10-17（窗口前）、10-19 满员且与本人两场同日活动冲突的 A-002、10-20 尚
