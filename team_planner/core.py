@@ -1831,6 +1831,191 @@ class TeamPlanner(JsonStore):
             rows.append({"member_id": member_id, "name": members[member_id]["name"], "groups": group_rows})
         return {"from_on": from_on, "to_on": to_on, "members": rows}
 
+    def training_coverage(self, groups, from_on, to_on, minimum_count, member_ids=None):
+        # Read-only headcount reconciliation over a fixed date range: each day
+        # of the closed from_on..to_on range is judged exactly like
+        # training_validity with that day as the cutoff, and a member counts
+        # once on a day when every selected group is valid for them that day.
+        # Consecutive days with the same qualified members merge into one
+        # maximal closed period; a same-size swap of people still splits, a
+        # mere change of the underlying completion record does not. Groups
+        # exist only for this call; current rosters, profiles and completion
+        # records are used as they are, never reconstructed historically, and
+        # the current date is never consulted.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        selected_groups = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids", "valid_days"}:
+                raise ValueError("each group must contain only group_id, activity_ids and valid_days")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group_ids must not contain duplicates")
+            seen_groups.add(group_id)
+            valid_days = positive(item["valid_days"], "valid_days")
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            group_activities = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # As in training_validity, an activity belongs to exactly one
+                # group and may not repeat inside it.
+                if activity_id in seen_activities:
+                    raise ValueError("activity_ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                group_activities.append(activity_id)
+            selected_groups.append((group_id, group_activities, valid_days))
+        from_on = day(from_on, "from_on")
+        to_on = day(to_on, "to_on")
+        if from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        # The expected headcount is a non-boolean positive integer; it may
+        # exceed the number of selected members.
+        minimum_count = positive(minimum_count, "minimum_count")
+        # member_ids follows training_validity_timeline exactly: omitted or
+        # null means every member, an empty array means no members at all.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Every reference is validated even when nobody is selected.
+        for _, activity_ids, _ in selected_groups:
+            for activity_id in activity_ids:
+                if activities.get(activity_id) is None:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        start = date.fromisoformat(from_on)
+        end = date.fromisoformat(to_on)
+
+        def valid_intervals(member_id, activity_ids, valid_days):
+            # The eligible records are exactly training_validity's: a stored
+            # completion only exists for enrolled members, and a missing
+            # record is the same as no record. Records become eligible on
+            # their completion date, so a future record never hides an older
+            # expired one.
+            records_by_date = {}
+            for activity_id in activity_ids:
+                activity = activities[activity_id]
+                if member_id not in activity.get("participants", []):
+                    continue
+                completed_on = completions.get(activity_id, {}).get(member_id)
+                if completed_on is not None:
+                    records_by_date.setdefault(date.fromisoformat(completed_on), []).append(
+                        (activity["on"], activity_id)
+                    )
+            # The selected record can only change when a record with a later
+            # completion date becomes eligible; an equal completion date
+            # breaks by activity date and activity id, both ascending, exactly
+            # as in training_validity. Only the takeover dates matter here,
+            # not which record wins.
+            takeovers = sorted(records_by_date)
+            intervals = []
+            for index, completed in enumerate(takeovers):
+                segment_end = takeovers[index + 1] - timedelta(days=1) if index + 1 < len(takeovers) else date.max
+                # The expiry is the completion day plus valid_days calendar
+                # days; the expiry day itself is expired. An expiry past
+                # date.max is beyond every possible range end, so the record
+                # stays valid through the range instead of raising.
+                try:
+                    expires = completed + timedelta(days=valid_days)
+                except OverflowError:
+                    expires = None
+                valid_end = segment_end if expires is None else min(segment_end, expires - timedelta(days=1))
+                frm, to = max(completed, start), min(valid_end, end)
+                if frm <= to:
+                    intervals.append((frm, to))
+            return intervals
+
+        def intersect(first, second):
+            # Both lists hold sorted, disjoint closed intervals; the result
+            # keeps only the days covered by both.
+            merged = []
+            i = j = 0
+            while i < len(first) and j < len(second):
+                frm = max(first[i][0], second[j][0])
+                to = min(first[i][1], second[j][1])
+                if frm <= to:
+                    merged.append((frm, to))
+                if first[i][1] < second[j][1]:
+                    i += 1
+                else:
+                    j += 1
+            return merged
+
+        # Per member, the days on which every selected group is valid at once.
+        qualified = []
+        for member_id in ordered_member_ids:
+            intervals = valid_intervals(member_id, selected_groups[0][1], selected_groups[0][2])
+            for _, activity_ids, valid_days in selected_groups[1:]:
+                if not intervals:
+                    break
+                intervals = intersect(intervals, valid_intervals(member_id, activity_ids, valid_days))
+            qualified.append(intervals)
+
+        # Sweep the range: the qualified set can only change where a member's
+        # interval starts or ends, so the days between consecutive edges share
+        # one set. Every edge lies inside the range, so no date overflows.
+        edges = set()
+        for intervals in qualified:
+            for frm, to in intervals:
+                if frm > start:
+                    edges.add(frm)
+                if to < end:
+                    edges.add(to + timedelta(days=1))
+        boundaries = [start] + sorted(edges)
+        periods = []
+        for index, frm in enumerate(boundaries):
+            to = boundaries[index + 1] - timedelta(days=1) if index + 1 < len(boundaries) else end
+            ids = tuple(
+                member_id
+                for member_id, intervals in zip(ordered_member_ids, qualified)
+                if any(f <= frm <= t for f, t in intervals)
+            )
+            if periods and periods[-1][2] == ids:
+                # Same qualified members on the following days extend the open
+                # period instead of starting a new one.
+                periods[-1][1] = to
+            else:
+                periods.append([frm, to, ids])
+        return {
+            "from_on": from_on,
+            "to_on": to_on,
+            "minimum_count": minimum_count,
+            "periods": [
+                {
+                    "from_on": frm.isoformat(),
+                    "to_on": to.isoformat(),
+                    "valid_member_ids": list(ids),
+                    "valid_count": len(ids),
+                    "shortage_count": max(0, minimum_count - len(ids)),
+                }
+                for frm, to, ids in periods
+            ],
+        }
+
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
             from_on = day(from_on, "from_on")
