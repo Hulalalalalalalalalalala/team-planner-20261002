@@ -2208,5 +2208,157 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([m["member_id"] for m in reopened.roster("A-003")["members"]], ["M-001"])
         self.assertEqual([m["member_id"] for m in reopened.roster("A-002")["members"]], ["M-001", "M-002"])
 
+    def _split_ready(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "新成员产品介绍", "2026-10-15", 3)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-001", "M-002")
+        self.app.enroll("A-001", "M-003")
+
+    def test_split_activity_moves_members_in_input_order(self):
+        self._split_ready()
+        # 小林、小陈依次分到同日新场：新名单按输入顺序，原场保留小周。
+        result = self.app.split_activity("A-001", "A-101", "进阶培训", "2026-10-15", 2, ["M-002", "M-001"])
+        self.assertEqual(set(result), {"source_activity", "new_activity"})
+        self.assertEqual(result["new_activity"], {"activity_id": "A-101", "title": "进阶培训", "on": "2026-10-15", "capacity": 2, "participants": ["M-002", "M-001"]})
+        self.assertEqual(result["source_activity"]["participants"], ["M-003"])
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-101")["members"]], ["M-002", "M-001"])
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-001")["members"]], ["M-003"])
+        # 查询与导出随即反映新名单。
+        self.assertEqual([r["activity_id"] for r in reopened.member_schedule("M-002")], ["A-101"])
+        exported = reopened.export_schedule()
+        self.assertEqual(exported["row_count"], 3)
+        self.assertIn("M-002,小林,A-101", exported["csv"])
+
+    def test_split_activity_keeps_relative_order_and_empty_source(self):
+        self._split_ready()
+        result = self.app.split_activity("A-001", "A-101", "进阶培训", "2026-10-16", 2, ["M-002"])
+        self.assertEqual(result["source_activity"]["participants"], ["M-001", "M-003"])
+        # 全部移出后空名单的原场仍保留。
+        result = self.app.split_activity("A-001", "A-102", "补训", "2026-10-17", 5, ["M-001", "M-003"])
+        self.assertEqual(result["source_activity"]["participants"], [])
+        self.assertEqual(result["new_activity"]["participants"], ["M-001", "M-003"])
+        self.assertEqual([a["activity_id"] for a in TeamPlanner(self.root).activities()], ["A-001", "A-101", "A-102"])
+
+    def test_split_activity_preserves_fields_and_completions(self):
+        self._split_ready()
+        # 他人的原场完成记录不阻止分场，记录与额外字段全部保留。
+        self.app.record_completion("A-001", "M-003", "2026-10-15")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["activities"]["A-001"]["location"] = "一号会议室"
+        data["note"] = "imported"
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.split_activity(" A-001 ", " A-101 ", " 进阶培训 ", "2026-10-15", 2, [" M-001 ", "M-002"])
+        self.assertEqual(result["source_activity"]["location"], "一号会议室")
+        self.assertEqual(result["source_activity"]["participants"], ["M-003"])
+        self.assertEqual(set(result["new_activity"]), {"activity_id", "title", "on", "capacity", "participants"})
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["note"], "imported")
+        self.assertEqual(stored["completions"], {"A-001": {"M-003": "2026-10-15"}})
+        self.assertNotIn("A-101", stored["completions"])
+        self.assertEqual([r["activity_id"] for r in self.app.completions("M-003")], ["A-001"])
+
+    def test_split_activity_rejections_leave_bytes_unchanged(self):
+        self._split_ready()
+        self.app.create_activity("A-002", "安全规范", "2026-10-20", 2)
+        self.app.enroll("A-002", "M-001")
+        self.app.add_member("M-004", "小李")
+        before = self.app.path.read_bytes()
+        for kwargs in [
+            # 标识、标题、成员标识去空白后须非空。
+            {"source_activity_id": "  ", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": " ", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["  "]},
+            # member_ids 只接受非空数组且规范化后无重复。
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": []},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": "M-001"},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-001", " M-001 "]},
+            # 日期只接受无首尾空白的真实 YYYY-MM-DD。
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": " 2026-10-15", "capacity": 2, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-02-30", "capacity": 2, "member_ids": ["M-001"]},
+            # 容量须为非布尔正整数且不少于转移人数。
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": True, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 0, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 1, "member_ids": ["M-001", "M-002"]},
+            # 原场与成员须存在，新场标识不得已存在。
+            {"source_activity_id": "GHOST", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-001"]},
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["GHOST"]},
+            {"source_activity_id": "A-001", "activity_id": "A-002", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-002"]},
+            {"source_activity_id": "A-001", "activity_id": "A-001", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-002"]},
+            # 所选成员均须已报名原场（M-004 存在但未报名）。
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-004"]},
+            # 所选成员在新日期仍报名第三场活动（M-001 在 A-002 是 2026-10-20）。
+            {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-20", "capacity": 2, "member_ids": ["M-001"]},
+        ]:
+            with self.assertRaises(ValueError, msg=kwargs):
+                self.app.split_activity(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 本人已有原场完成记录则整次拒绝；第三场已完成报名也算冲突。
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        self.app.record_completion("A-002", "M-001", "2026-10-20")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.split_activity("A-001", "A-101", "进阶", "2026-10-15", 2, ["M-002"])
+        with self.assertRaises(ValueError):
+            self.app.split_activity("A-001", "A-101", "进阶", "2026-10-20", 2, ["M-001"])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 他人的完成记录不阻止分场：移出小陈后小林记录仍在原场。
+        result = self.app.split_activity("A-001", "A-101", "进阶", "2026-10-15", 2, ["M-001"])
+        self.assertEqual(result["source_activity"]["participants"], ["M-002", "M-003"])
+
+    def test_split_activity_invalid_does_not_create_file(self):
+        with self.assertRaises(ValueError):
+            self.app.split_activity("A-001", "A-101", "进阶", "2026-10-15", 2, ["M-001"])
+        self.assertFalse(self.app.path.exists())
+        with self.assertRaises(ValueError):
+            self.app.split_activity("A-001", "A-101", "进阶", "2026-02-30", 2, ["M-001"])
+        self.assertFalse(self.app.path.exists())
+
+    def test_split_activity_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        app = TeamPlanner(legacy)
+        app.add_member("M-001", "小陈")
+        app.create_activity("A-001", "新成员产品介绍", "2026-10-15", 2)
+        app.enroll("A-001", "M-001")
+        data = json.loads(app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = TeamPlanner(legacy).split_activity("A-001", "A-101", "进阶", "2026-10-15", 1, ["M-001"])
+        self.assertEqual(result["new_activity"]["participants"], ["M-001"])
+        self.assertNotIn("completions", json.loads(app.path.read_text(encoding="utf-8")))
+
+    def test_cli_split_activity_success_failure_and_partial_array(self):
+        self._split_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "split-activity", name], text=True, capture_output=True)
+        ok = run({"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶培训", "on": "2026-10-15", "capacity": 2, "member_ids": ["M-002", "M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["new_activity"]["participants"], ["M-002", "M-001"])
+        self.assertEqual(value["source_activity"]["participants"], ["M-003"])
+        # 新场标识已存在：失败时标准输出为空，标准错误输出含 error 的 JSON。
+        bad = run({"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 1, "member_ids": ["M-003"]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # 顶层数组逐项执行：第一组分场保留，第二组失败后标准输出为空。
+        partial = run([
+            {"source_activity_id": "A-001", "activity_id": "A-102", "title": "补训", "on": "2026-10-16", "capacity": 1, "member_ids": ["M-003"]},
+            {"source_activity_id": "A-001", "activity_id": "A-102", "title": "补训", "on": "2026-10-16", "capacity": 1, "member_ids": ["M-003"]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([m["member_id"] for m in reopened.roster("A-102")["members"]], ["M-003"])
+        self.assertEqual(reopened.roster("A-001")["members"], [])
+
 if __name__ == "__main__":
     unittest.main()

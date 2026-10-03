@@ -297,6 +297,65 @@ class TeamPlanner(JsonStore):
         )
         return {"can_transfer": can_transfer, "changes": preview}
 
+    def split_activity(self, source_activity_id, activity_id, title, on, capacity, member_ids):
+        # The new session and the enrollment move take effect together: every
+        # value is normalized and checked before the source roster is touched
+        # or the new activity is created.
+        source_activity_id = text(source_activity_id, "source_activity_id")
+        activity_id, title = text(activity_id, "activity_id"), text(title, "title")
+        on, capacity = day(on, "on"), positive(capacity, "capacity")
+        if not isinstance(member_ids, list) or not member_ids:
+            raise ValueError("member_ids must be a nonempty array")
+        selected = []
+        seen = set()
+        for member_id in member_ids:
+            member_id = text(member_id, "member_id")
+            if member_id in seen:
+                raise ValueError("member_ids must not contain duplicates")
+            seen.add(member_id)
+            selected.append(member_id)
+        # The new session must seat everyone moved into it.
+        if capacity < len(selected):
+            raise ValueError("capacity must be at least the number of moved members")
+        data = self._read()
+        activities = data.get("activities", {})
+        members = data.get("members", {})
+        source = activities.get(source_activity_id)
+        if source is None:
+            raise ValueError("unknown activity")
+        if activity_id in activities:
+            raise ValueError("activity already exists")
+        completions = data.get("completions", {})
+        for member_id in selected:
+            if member_id not in members:
+                raise ValueError("unknown member")
+            if member_id not in source["participants"]:
+                raise ValueError("member is not enrolled in the source activity")
+            # Only the member's own completion record for the source activity
+            # blocks the move; other members' records never do, and no record
+            # is ever deleted or migrated.
+            if member_id in completions.get(source_activity_id, {}):
+                raise ValueError("member has a completion record for the source activity")
+        # A moved member must not keep a seat in a third activity on the new
+        # date. Completion does not cancel enrollment, so participants lists
+        # already cover finished trainings; the source is excluded and other
+        # members' enrollments or other dates never block the split.
+        for member_id in selected:
+            for other_id, other in activities.items():
+                if other_id == source_activity_id:
+                    continue
+                if other.get("on") == on and member_id in other.get("participants", []):
+                    raise ValueError("member is enrolled in another activity on that date")
+        # Members who stay keep their relative order; the new roster follows
+        # the input order exactly. The source keeps all its other fields and
+        # stays in the file even when its roster becomes empty.
+        moving = set(selected)
+        source["participants"] = [member_id for member_id in source["participants"] if member_id not in moving]
+        activity = {"activity_id": activity_id, "title": title, "on": on, "capacity": capacity, "participants": list(selected)}
+        activities[activity_id] = activity
+        self._write(data)
+        return {"source_activity": source, "new_activity": activity}
+
     def cancel_enrollments(self, member_id, activity_ids):
         member_id = text(member_id, "member_id")
         if not isinstance(activity_ids, list) or not activity_ids:

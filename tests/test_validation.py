@@ -290,6 +290,36 @@ class ValidationTests(unittest.TestCase):
                 {"source_activity_id": "A-002", "target_activity_id": "A-001", "member_id": "M-003"},
             ])
 
+    def test_split_activity_also_rejects_broken_history(self):
+        # The split runs the same whole-history validation: a valid request
+        # against a broken document fails with ValueError and leaves the bytes.
+        good = {"source_activity_id": "A-001", "activity_id": "A-101", "title": "进阶", "on": "2026-10-15", "capacity": 1, "member_ids": ["M-002"]}
+        broken = dict(LEGACY)
+        broken["members"] = dict(LEGACY["members"])
+        broken["members"]["M-002"] = {"member_id": "M-002", "name": "   "}
+        before = self.write(broken)
+        with self.assertRaises(ValueError):
+            self.app.split_activity(**good)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # A broken request (duplicate member after normalization) fails
+        # argument validation before the filesystem is even touched.
+        self.write(LEGACY)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.split_activity("A-001", "A-101", "进阶", "2026-10-15", 2, ["M-002", " M-002 "])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # The valid legacy document splits normally: M-001's own completion
+        # record for A-003 does not block moving M-002 out of A-001.
+        result = self.app.split_activity(**good)
+        self.assertEqual(result["new_activity"]["participants"], ["M-002"])
+        self.assertEqual(result["source_activity"]["participants"], ["M-001"])
+
+    def test_split_activity_os_error_stays_an_os_error(self):
+        # data.json itself being a directory stays an operating-system error.
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.split_activity("A-001", "A-101", "进阶", "2026-10-15", 1, ["M-002"])
+
     def test_unrelated_broken_record_is_not_hidden_by_filters(self):
         # Querying M-001's own data must still fail because of M-002's broken
         # profile and A-002's broken completion record.
