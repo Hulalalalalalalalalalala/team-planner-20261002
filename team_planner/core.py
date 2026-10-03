@@ -2238,6 +2238,256 @@ class TeamPlanner(JsonStore):
             ],
         }
 
+    def absence_start_options(self, groups, from_on, to_on, minimum_count, absences, member_id, days, member_ids=None):
+        # Read-only recommendation over preview_absence_coverage: for a member
+        # taking days consecutive calendar days off, list the start dates for
+        # which every day of the whole leave still has at least minimum_count
+        # qualified and present members. Qualification, absence union and
+        # history rules are exactly preview_absence_coverage's; nothing is ever
+        # stored, and the current date is never consulted.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        selected_groups = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids", "valid_days"}:
+                raise ValueError("each group must contain only group_id, activity_ids and valid_days")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group_ids must not contain duplicates")
+            seen_groups.add(group_id)
+            valid_days = positive(item["valid_days"], "valid_days")
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            group_activities = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # As in preview_absence_coverage, an activity belongs to exactly
+                # one group and may not repeat inside it.
+                if activity_id in seen_activities:
+                    raise ValueError("activity_ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                group_activities.append(activity_id)
+            selected_groups.append((group_id, group_activities, valid_days))
+        from_on = day(from_on, "from_on")
+        to_on = day(to_on, "to_on")
+        if from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        minimum_count = positive(minimum_count, "minimum_count")
+        # The leave requester is a required, trimmed, known identifier; days is
+        # a required non-boolean positive integer.
+        member_id = text(member_id, "member_id")
+        days = positive(days, "days")
+        # As in preview_absence_coverage, absences is required: null (or a
+        # missing argument) is rejected, while an empty array previews none.
+        if absences is None or not isinstance(absences, list):
+            raise ValueError("absences must be an array")
+        absence_entries = []
+        for item in absences:
+            if not isinstance(item, dict) or set(item) != {"member_id", "from_on", "to_on"}:
+                raise ValueError("each absence must contain only member_id, from_on and to_on")
+            absence_member_id = text(item["member_id"], "member_id")
+            absence_from = day(item["from_on"], "from_on")
+            absence_to = day(item["to_on"], "to_on")
+            # Whole-day closed intervals; a reversed range is rejected.
+            if absence_from > absence_to:
+                raise ValueError("from_on must be on or before to_on")
+            absence_entries.append((absence_member_id, absence_from, absence_to))
+        # member_ids follows preview_absence_coverage exactly: omitted or null
+        # means every member, an empty array means no members at all.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for selected_id in member_ids:
+                selected_id = text(selected_id, "member_id")
+                if selected_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(selected_id)
+                selected_member_ids.append(selected_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Every reference is validated even when nobody is selected and every
+        # absence falls outside the range.
+        for _, activity_ids, _ in selected_groups:
+            for activity_id in activity_ids:
+                if activities.get(activity_id) is None:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for selected_id in selected_member_ids:
+                if selected_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        # The requester must exist and belong to the selected personnel; the
+        # member_ids array itself keeps its exact input order and content.
+        if member_id not in members:
+            raise ValueError("unknown member")
+        if member_id not in ordered_member_ids:
+            raise ValueError("member_id must be among the selected member ids")
+        for absence_member_id, _, _ in absence_entries:
+            if absence_member_id not in members:
+                raise ValueError("unknown member")
+        start = date.fromisoformat(from_on)
+        end = date.fromisoformat(to_on)
+        total_days = (end - start).days + 1
+
+        def valid_intervals(person_id, activity_ids, valid_days_value):
+            # The eligible records are exactly preview_absence_coverage's: a
+            # stored completion only exists for enrolled members, and a missing
+            # record is the same as no record.
+            records_by_date = {}
+            for activity_id in activity_ids:
+                activity = activities[activity_id]
+                if person_id not in activity.get("participants", []):
+                    continue
+                completed_on = completions.get(activity_id, {}).get(person_id)
+                if completed_on is not None:
+                    records_by_date.setdefault(date.fromisoformat(completed_on), []).append(
+                        (activity["on"], activity_id)
+                    )
+            takeovers = sorted(records_by_date)
+            intervals = []
+            for index, completed in enumerate(takeovers):
+                segment_end = takeovers[index + 1] - timedelta(days=1) if index + 1 < len(takeovers) else date.max
+                # The expiry is the completion day plus valid_days calendar
+                # days; the expiry day itself is expired. An expiry past
+                # date.max is beyond every possible range end, so the record
+                # stays valid through the range instead of raising.
+                try:
+                    expires = completed + timedelta(days=valid_days_value)
+                except OverflowError:
+                    expires = None
+                valid_end = segment_end if expires is None else min(segment_end, expires - timedelta(days=1))
+                frm, to = max(completed, start), min(valid_end, end)
+                if frm <= to:
+                    intervals.append((frm, to))
+            return intervals
+
+        def intersect(first, second):
+            # Both lists hold sorted, disjoint closed intervals; the result
+            # keeps only the days covered by both.
+            merged = []
+            i = j = 0
+            while i < len(first) and j < len(second):
+                frm = max(first[i][0], second[j][0])
+                to = min(first[i][1], second[j][1])
+                if frm <= to:
+                    merged.append((frm, to))
+                if first[i][1] < second[j][1]:
+                    i += 1
+                else:
+                    j += 1
+            return merged
+
+        # A leave longer than the whole closed range can never fit inside it;
+        # all inputs and the history above are still validated first.
+        if days > total_days:
+            start_windows = []
+        else:
+            # Per member, the days on which every selected group is valid at
+            # once; membership is evaluated per day, so each candidate sees the
+            # requester unqualified exactly on the days they really are.
+            qualified = []
+            for person_id in ordered_member_ids:
+                intervals = valid_intervals(person_id, selected_groups[0][1], selected_groups[0][2])
+                for _, activity_ids, valid_days_value in selected_groups[1:]:
+                    if not intervals:
+                        break
+                    intervals = intersect(intervals, valid_intervals(person_id, activity_ids, valid_days_value))
+                qualified.append(intervals)
+
+            # Per selected member other than the requester, the known absence
+            # days inside the range: repeated, overlapping or adjacent requests
+            # are a union of days and never deduct the member twice. The
+            # requester's own known absences are collected too but never change
+            # the count during a candidate window, since the requester is
+            # already away for that whole window (deducting them again on an
+            # overlapping day would count one person twice); days outside the
+            # range are validated above but never change the counts.
+            absent = {person_id: [] for person_id in ordered_member_ids}
+            for absence_person_id, absence_from, absence_to in absence_entries:
+                if absence_person_id not in absent:
+                    continue
+                frm = max(date.fromisoformat(absence_from), start)
+                to = min(date.fromisoformat(absence_to), end)
+                if frm <= to:
+                    absent[absence_person_id].append((frm, to))
+
+            def absent_on(person_id, day_on):
+                # Known absences only; the candidate leave belongs to the
+                # requester alone and is handled at the requester position.
+                return any(f <= day_on <= t for f, t in absent[person_id])
+
+            qualified_by_member = dict(zip(ordered_member_ids, qualified))
+            requester_position = ordered_member_ids.index(member_id)
+            # The latest first day still fits days calendar days inside the
+            # closed range; offsets keep every computed date at or below end,
+            # so a range ending on 9999-12-31 never overflows.
+            good_starts = []
+            for start_offset in range(total_days - days + 1):
+                candidate_start = start + timedelta(days=start_offset)
+                feasible = True
+                # Every day of the leave is judged independently; a shortage
+                # outside the candidate window never affects this candidate.
+                # Offsets avoid incrementing past the last representable date.
+                for offset in range(days):
+                    day_on = candidate_start + timedelta(days=offset)
+                    count = 0
+                    for position, person_id in enumerate(ordered_member_ids):
+                        if not any(f <= day_on <= t for f, t in qualified_by_member[person_id]):
+                            # An unqualified member is not counted whether or
+                            # not they are marked away that day.
+                            continue
+                        if position == requester_position:
+                            # The requester is on this candidate leave every day
+                            # of the window; qualified or not, they never count
+                            # as present. A day their known absences already
+                            # cover is the same union day, so it is not deduced
+                            # a second time anywhere.
+                            continue
+                        if absent_on(person_id, day_on):
+                            continue
+                        count += 1
+                        if count >= minimum_count:
+                            break
+                    if count < minimum_count:
+                        feasible = False
+                        break
+                if feasible:
+                    good_starts.append(candidate_start)
+            # Consecutive feasible start dates merge into maximal closed
+            # intervals by date alone: the underlying qualified members may
+            # change between two starts without splitting a window, because
+            # every start in it is independently feasible. Subtraction (never
+            # addition) keeps a window ending on 9999-12-31 free of overflow.
+            start_windows = []
+            for good_start in good_starts:
+                if start_windows and good_start - timedelta(days=1) == start_windows[-1][1]:
+                    start_windows[-1][1] = good_start
+                else:
+                    start_windows.append([good_start, good_start])
+        return {
+            "from_on": from_on,
+            "to_on": to_on,
+            "minimum_count": minimum_count,
+            "member_id": member_id,
+            "days": days,
+            "start_windows": [
+                {"from_on": frm.isoformat(), "to_on": to.isoformat()}
+                for frm, to in start_windows
+            ],
+        }
+
     def export_schedule(self, from_on=None, to_on=None, status="all"):
         if from_on is not None:
             from_on = day(from_on, "from_on")
