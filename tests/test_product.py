@@ -3646,6 +3646,244 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _absence_ready(self):
+        # 与 _coverage_ready 相同的基础数据，供拟请假预览使用。
+        self._coverage_ready()
+
+    def test_preview_absence_coverage_example(self):
+        self._absence_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        # 小陈 2026-10-15 完成全部组且有效三天，只在 16 日请假、期望一人：
+        # 15、17 日可出勤一人，16、18 日欠缺一人，18 日合格人数也为零。
+        result = self.app.preview_absence_coverage(
+            groups, "2026-10-15", "2026-10-18", 1,
+            [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}], ["M-001"])
+        self.assertEqual(result, {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-18",
+            "minimum_count": 1,
+            "periods": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-15", "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                {"from_on": "2026-10-16", "to_on": "2026-10-16", "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": ["M-001"], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+                {"from_on": "2026-10-17", "to_on": "2026-10-17", "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                {"from_on": "2026-10-18", "to_on": "2026-10-18", "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+            ],
+        })
+
+    def test_preview_absence_coverage_union_and_out_of_range(self):
+        self._absence_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        # 重复、重叠、相邻的请假按日期并集处理，不重复扣人；范围外的日期及
+        # 未入选的已知成员不影响人数。
+        absences = [
+            {"member_id": " M-001 ", "from_on": "2026-10-16", "to_on": "2026-10-17"},
+            {"member_id": "M-001", "from_on": "2026-10-17", "to_on": "2026-10-18"},
+            {"member_id": "M-001", "from_on": "2026-10-19", "to_on": "2026-10-19"},
+            {"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"},
+            {"member_id": "M-001", "from_on": "2026-11-01", "to_on": "2026-11-02"},
+            {"member_id": "M-002", "from_on": "2026-10-15", "to_on": "2026-10-17"},
+        ]
+        result = self.app.preview_absence_coverage(groups, "2026-10-15", "2026-10-20", 1, absences, ["M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-16", "to_on": "2026-10-17", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": ["M-001"], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+            # 18、19 日小陈在请假但已不合格：请假名单只收录合格者中的请假者，
+            # 与 20 日合为一段。
+            {"from_on": "2026-10-18", "to_on": "2026-10-20", "valid_member_ids": [], "valid_count": 0,
+             "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+        ])
+
+    def test_preview_absence_coverage_personnel_swap_and_empty_absences(self):
+        self._absence_ready()
+        # 小林 10-18 完成入门二：18 至 20 日换成小林合格，人数相同仍分段；
+        # 小林 19 日请假只影响他自己的区间。
+        self.app.record_completion("A-002", "M-002", "2026-10-18")
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        result = self.app.preview_absence_coverage(
+            groups, "2026-10-15", "2026-10-20", 1,
+            [{"member_id": "M-002", "from_on": "2026-10-19", "to_on": "2026-10-19"}], ["M-002", "M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-18", "to_on": "2026-10-18", "valid_member_ids": ["M-002"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-19", "to_on": "2026-10-19", "valid_member_ids": ["M-002"], "valid_count": 1,
+             "absent_member_ids": ["M-002"], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+            {"from_on": "2026-10-20", "to_on": "2026-10-20", "valid_member_ids": ["M-002"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+        ])
+        # 空请假数组与 training-coverage 的名单和人数一致，仅多出请假相关字段。
+        plain = self.app.training_coverage(groups, "2026-10-15", "2026-10-20", 1, ["M-002", "M-001"])
+        preview = self.app.preview_absence_coverage(groups, "2026-10-15", "2026-10-20", 1, [], ["M-002", "M-001"])
+        self.assertEqual(
+            [{k: v for k, v in period.items() if k in ("from_on", "to_on", "valid_member_ids", "valid_count", "shortage_count")}
+             for period in preview["periods"]],
+            plain["periods"])
+        for period in preview["periods"]:
+            self.assertEqual(period["absent_member_ids"], [])
+            self.assertEqual(period["available_member_ids"], period["valid_member_ids"])
+            self.assertEqual(period["available_count"], period["valid_count"])
+
+    def test_preview_absence_coverage_member_selection_and_empty(self):
+        self._absence_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        # 省略或 null 选择全员（按成员标识升序）；只有小陈在范围内合格，未合格
+        # 成员的请假不出现在请假名单中。
+        absences = [{"member_id": "M-002", "from_on": "2026-10-15", "to_on": "2026-10-17"}]
+        expected = [
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 1},
+        ]
+        self.assertEqual(self.app.preview_absence_coverage(groups, "2026-10-15", "2026-10-17", 2, absences)["periods"], expected)
+        self.assertEqual(self.app.preview_absence_coverage(groups, "2026-10-15", "2026-10-17", 2, absences, None)["periods"], expected)
+        # 空数组表示无人：仍返回一个覆盖全范围的区间，人数为零且欠缺数等于
+        # 期望人数；未入选成员的请假仍须校验但不影响结果。
+        empty = self.app.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2, absences, [])
+        self.assertEqual(empty, {
+            "from_on": "2026-10-14",
+            "to_on": "2026-10-19",
+            "minimum_count": 2,
+            "periods": [
+                {"from_on": "2026-10-14", "to_on": "2026-10-19", "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 2},
+            ],
+        })
+
+    def test_preview_absence_coverage_rejections(self):
+        self._absence_ready()
+        valid_groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        valid_absences = [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}]
+        # 缺少 absences 或显式 null、非数组均被拒绝；空数组合法。
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", 2)
+        for absences in [None, "x", 1, {}]:
+            with self.assertRaises(ValueError, msg=absences):
+                self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", 2, absences)
+        # 条目字段不符、标识非法、日期非法或逆序、未知成员均被拒绝。
+        for absences in [[{}],
+                         [{"member_id": "M-001", "from_on": "2026-10-16"}],
+                         [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16", "extra": 1}],
+                         [{"member_id": " ", "from_on": "2026-10-16", "to_on": "2026-10-16"}],
+                         [{"member_id": 123, "from_on": "2026-10-16", "to_on": "2026-10-16"}],
+                         [{"member_id": "GHOST", "from_on": "2026-10-16", "to_on": "2026-10-16"}],
+                         [{"member_id": "M-001", "from_on": "2026-02-30", "to_on": "2026-10-16"}],
+                         [{"member_id": "M-001", "from_on": " 2026-10-16", "to_on": "2026-10-16"}],
+                         [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": None}],
+                         [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": 20261016}],
+                         [{"member_id": "M-001", "from_on": "2026-10-17", "to_on": "2026-10-16"}]]:
+            with self.assertRaises(ValueError, msg=absences):
+                self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", 2, absences)
+        # 无人入选或请假在范围外时仍校验全部输入：未知活动、未知成员、非法日期。
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3}],
+                "2026-10-14", "2026-10-19", 2, valid_absences, [])
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", 2,
+                                              [{"member_id": "GHOST", "from_on": "2026-11-01", "to_on": "2026-11-02"}], [])
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", 2,
+                                              [{"member_id": "M-001", "from_on": "2026-11-02", "to_on": "2026-11-01"}], [])
+        # 沿用 training-coverage 的既有校验：分组、范围日期、期望人数、成员选择。
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage([], "2026-10-14", "2026-10-19", 2, valid_absences)
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(valid_groups, "2026-10-20", "2026-10-19", 2, valid_absences)
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", True, valid_absences)
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(valid_groups, "2026-10-14", "2026-10-19", 2, valid_absences, ["M-001", " M-001 "])
+
+    def test_preview_absence_coverage_never_writes_and_legacy_data(self):
+        self._absence_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 3}]
+        absences = [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}]
+        before = self.app.path.read_bytes()
+        self.app.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2, absences)
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2,
+                                              [{"member_id": "GHOST", "from_on": "2026-10-16", "to_on": "2026-10-16"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 旧数据缺少 completions：按无记录处理，查询不补写该字段。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2, absences)
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-19", "valid_member_ids": [], "valid_count": 0,
+             "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 2},
+        ])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty-absence"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2, absences)
+        self.assertFalse(empty.exists())
+
+    def test_preview_absence_coverage_broken_history_and_os_error(self):
+        self._absence_ready()
+        groups = [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}]
+        absences = [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}]
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2, absences)
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.preview_absence_coverage(groups, "2026-10-14", "2026-10-19", 2, absences)
+
+    def test_cli_preview_absence_coverage_success_failure_and_partial_array(self):
+        self._absence_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "preview-absence-coverage", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-ENTRY ", "activity_ids": [" A-001 ", "A-002"], "valid_days": 3}],
+                  "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 1,
+                  "absences": [{"member_id": " M-001 ", "from_on": "2026-10-16", "to_on": "2026-10-16"}],
+                  "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["minimum_count"], 1)
+        self.assertEqual(value["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-16", "to_on": "2026-10-16", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": ["M-001"], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+            {"from_on": "2026-10-17", "to_on": "2026-10-17", "valid_member_ids": ["M-001"], "valid_count": 1,
+             "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+            {"from_on": "2026-10-18", "to_on": "2026-10-18", "valid_member_ids": [], "valid_count": 0,
+             "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+        ])
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+                   "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 1})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+             "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 1, "absences": [], "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+             "from_on": "2026-10-15", "to_on": "2026-10-18", "minimum_count": 1,
+             "absences": [{"member_id": "GHOST", "from_on": "2026-10-16", "to_on": "2026-10-16"}]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
     def _renewal_ready(self):
         # 小陈 2026-10-15 在组内 A-001 完成、有效三天（10-18 到期）；组内另有
         # 10-17（窗口前）、10-19 满员且与本人两场同日活动冲突的 A-002、10-20 尚
