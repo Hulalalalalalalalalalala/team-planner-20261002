@@ -2360,5 +2360,164 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([m["member_id"] for m in reopened.roster("A-102")["members"]], ["M-003"])
         self.assertEqual(reopened.roster("A-001")["members"], [])
 
+    def _merge_ready(self):
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.create_activity("A-001", "目标场", "2026-10-15", 3)
+        self.app.create_activity("A-002", "来源一", "2026-10-15", 2)
+        self.app.create_activity("A-003", "来源二", "2026-10-15", 2)
+        self.app.enroll("A-001", "M-001")
+        self.app.enroll("A-002", "M-002")
+        self.app.enroll("A-002", "M-001")
+        self.app.enroll("A-003", "M-003")
+        self.app.enroll("A-003", "M-002")
+
+    def test_merge_activities_roster_order_and_source_removal(self):
+        self._merge_ready()
+        merged = self.app.merge_activities(" A-001 ", [" A-002 ", "A-003"])
+        self.assertEqual(merged["participants"], ["M-001", "M-002", "M-003"])
+        self.assertEqual(merged["title"], "目标场")
+        self.assertEqual([a["activity_id"] for a in TeamPlanner(self.root).activities()], ["A-001"])
+        # 旧来源标识随后按未知活动处理。
+        with self.assertRaises(ValueError):
+            TeamPlanner(self.root).roster("A-002")
+        # 名单查询立即反映合并结果。
+        self.assertEqual([m["member_id"] for m in TeamPlanner(self.root).roster("A-001")["members"]],
+                         ["M-001", "M-002", "M-003"])
+
+    def test_merge_activities_empty_source_and_extra_fields(self):
+        self._merge_ready()
+        self.app.create_activity("A-004", "空来源", "2026-10-15", 1)
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["activities"]["A-001"]["location"] = "一号会议室"
+        data["activities"]["A-004"]["location"] = "二号会议室"
+        data["note"] = "顶层备注"
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        merged = TeamPlanner(self.root).merge_activities("A-001", ["A-004"])
+        # 目标保留额外字段，来源额外字段随活动删除，顶层额外字段原样保留。
+        self.assertEqual(merged["location"], "一号会议室")
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("A-004", stored["activities"])
+        self.assertEqual(stored["note"], "顶层备注")
+
+    def test_merge_activities_completion_records(self):
+        self._merge_ready()
+        # 仅来源有记录：保留原日期并入目标。
+        self.app.record_completion("A-003", "M-003", "2026-10-16")
+        # 目标与来源对同一成员都有记录且日期相同：合为一条。
+        self.app.record_completion("A-001", "M-001", "2026-10-17")
+        self.app.record_completion("A-002", "M-001", "2026-10-17")
+        self.app.merge_activities("A-001", ["A-002", "A-003"])
+        self.assertEqual(self.app.completions("M-001"),
+                         [{"activity_id": "A-001", "member_id": "M-001", "completed_on": "2026-10-17", "title": "目标场", "on": "2026-10-15"}])
+        self.assertEqual(self.app.completions("M-003"),
+                         [{"activity_id": "A-001", "member_id": "M-003", "completed_on": "2026-10-16", "title": "目标场", "on": "2026-10-15"}])
+        # 没有记录的成员仍为未完成。
+        self.assertEqual(self.app.completions("M-002"), [])
+
+    def test_merge_activities_completion_date_conflict_rejected(self):
+        self._merge_ready()
+        self.app.record_completion("A-001", "M-001", "2026-10-16")
+        self.app.record_completion("A-002", "M-001", "2026-10-17")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.merge_activities("A-001", ["A-002"])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_merge_activities_capacity_and_date_rejections(self):
+        self._merge_ready()
+        self.app.create_activity("A-004", "小目标", "2026-10-15", 2)
+        self.app.create_activity("A-005", "异日", "2026-10-16", 2)
+        before = self.app.path.read_bytes()
+        # 去重后 3 人超过容量 2 的目标被拒。
+        with self.assertRaises(ValueError):
+            self.app.merge_activities("A-004", ["A-002", "A-003"])
+        # 来源与目标日期不同被拒。
+        with self.assertRaises(ValueError):
+            self.app.merge_activities("A-001", ["A-005"])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_merge_activities_input_validation(self):
+        self._merge_ready()
+        before = self.app.path.read_bytes()
+        for target, sources in [
+            ("A-001", []),
+            ("A-001", "A-002"),
+            ("A-001", ["A-002", " A-002 "]),
+            ("A-001", ["A-002", "A-001"]),
+            ("A-001", ["", "A-002"]),
+            ("A-001", [None]),
+            ("A-001", ["A-404"]),
+            ("A-404", ["A-002"]),
+        ]:
+            with self.assertRaises(ValueError):
+                self.app.merge_activities(target, sources)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_merge_activities_same_day_conflict_only_for_moved_members(self):
+        self._merge_ready()
+        # 转入成员小林在第三场同日活动仍报名：拒绝，已完成报名同样算冲突。
+        self.app.create_activity("A-004", "第三场", "2026-10-15", 2)
+        self.app.enroll("A-004", "M-002")
+        self.app.record_completion("A-004", "M-002", "2026-10-15")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.merge_activities("A-001", ["A-002"])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 目标原有成员小陈的历史同日冲突不阻止合并。
+        self.app.enroll("A-004", "M-001")
+        self.app.add_member("M-004", "小赵")
+        self.app.create_activity("A-005", "来源三", "2026-10-15", 1)
+        self.app.enroll("A-005", "M-004")
+        merged = self.app.merge_activities("A-001", ["A-005"])
+        self.assertEqual(merged["participants"], ["M-001", "M-004"])
+
+    def test_merge_activities_legacy_file_without_completions(self):
+        legacy = self.root / "legacy"
+        app = TeamPlanner(legacy)
+        app.add_member("M-001", "小陈")
+        app.create_activity("A-001", "目标场", "2026-10-15", 2)
+        app.create_activity("A-002", "来源", "2026-10-15", 1)
+        app.enroll("A-002", "M-001")
+        data = json.loads(app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        merged = TeamPlanner(legacy).merge_activities("A-001", ["A-002"])
+        self.assertEqual(merged["participants"], ["M-001"])
+        self.assertNotIn("completions", json.loads(app.path.read_text(encoding="utf-8")))
+
+    def test_merge_activities_invalid_does_not_create_file(self):
+        with self.assertRaises(ValueError):
+            self.app.merge_activities("A-001", ["A-002"])
+        self.assertFalse(self.app.path.exists())
+
+    def test_cli_merge_activities_success_failure_and_partial_array(self):
+        self._merge_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "merge-activities", name], text=True, capture_output=True)
+        ok = run({"target_activity_id": "A-001", "source_activity_ids": ["A-002", "A-003"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["participants"], ["M-001", "M-002", "M-003"])
+        # 旧来源标识按未知活动处理：失败时标准输出为空，标准错误输出含 error 的 JSON。
+        bad = run({"target_activity_id": "A-001", "source_activity_ids": ["A-002"]})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        # 顶层数组逐项执行：第一组合并保留，第二组失败后标准输出为空。
+        self.app.create_activity("A-004", "新目标", "2026-10-15", 1)
+        self.app.create_activity("A-005", "新来源", "2026-10-15", 1)
+        partial = run([
+            {"target_activity_id": "A-004", "source_activity_ids": ["A-005"]},
+            {"target_activity_id": "A-004", "source_activity_ids": ["A-005"]},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertEqual(partial.stdout, "")
+        reopened = TeamPlanner(self.root)
+        self.assertEqual([a["activity_id"] for a in reopened.activities()], ["A-001", "A-004"])
+
 if __name__ == "__main__":
     unittest.main()

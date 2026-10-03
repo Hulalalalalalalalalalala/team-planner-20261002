@@ -748,6 +748,89 @@ class TeamPlanner(JsonStore):
         self._write(data)
         return members[target]
 
+    def merge_activities(self, target_activity_id, source_activity_ids):
+        # The whole merge takes effect at once: every identifier is normalized
+        # and every condition is checked before any roster, activity or
+        # completion record is touched.
+        target_activity_id = text(target_activity_id, "target_activity_id")
+        if not isinstance(source_activity_ids, list) or not source_activity_ids:
+            raise ValueError("source_activity_ids must be a nonempty array")
+        source_ids = []
+        seen = set()
+        for source_activity_id in source_activity_ids:
+            source_activity_id = text(source_activity_id, "source_activity_id")
+            if source_activity_id in seen:
+                raise ValueError("source_activity_ids must not contain duplicates")
+            seen.add(source_activity_id)
+            source_ids.append(source_activity_id)
+        if target_activity_id in seen:
+            raise ValueError("target activity must not appear among the sources")
+        data = self._read()
+        activities = data.get("activities", {})
+        target = activities.get(target_activity_id)
+        if target is None:
+            raise ValueError("unknown activity")
+        # Titles may differ and empty rosters may be merged, but every source
+        # must share the target's date.
+        sources = []
+        for source_activity_id in source_ids:
+            source = activities.get(source_activity_id)
+            if source is None:
+                raise ValueError("unknown activity")
+            if source.get("on") != target["on"]:
+                raise ValueError("source activity must be on the same date as the target")
+            sources.append(source)
+        completions = data.get("completions", {})
+        # The final roster keeps the target's original order, then appends
+        # members not seen before in source input order and each source's own
+        # roster order; everyone occupies exactly one seat.
+        roster = list(target["participants"])
+        enrolled = set(roster)
+        moved = []
+        for source in sources:
+            for member_id in source.get("participants", []):
+                if member_id not in enrolled:
+                    enrolled.add(member_id)
+                    roster.append(member_id)
+                    moved.append(member_id)
+        if len(roster) > target["capacity"]:
+            raise ValueError("target activity is full")
+        # Only members newly joining the target are checked for same-day
+        # conflicts, judged after every source is removed: a seat kept in
+        # another activity on the target date rejects the merge. Completed
+        # enrollments still count; the target's original members, other
+        # members and other dates never block the merge.
+        removed = set(source_ids)
+        for member_id in moved:
+            for other_id, other in activities.items():
+                if other_id == target_activity_id or other_id in removed:
+                    continue
+                if other.get("on") == target["on"] and member_id in other.get("participants", []):
+                    raise ValueError("member is enrolled in another activity on that date")
+        # Completion records merge into the target: a record held by only one
+        # side keeps its original date, several records with the same date
+        # collapse into one, and differing dates reject the whole merge
+        # without picking or rewriting any date.
+        merged_completions = dict(completions.get(target_activity_id, {}))
+        for source_activity_id in source_ids:
+            for member_id, completed_on in completions.get(source_activity_id, {}).items():
+                existing = merged_completions.get(member_id)
+                if existing is not None and existing != completed_on:
+                    raise ValueError("completion dates differ for the member")
+                merged_completions[member_id] = completed_on
+        # The target keeps its identifier, title, date, capacity and extra
+        # fields; the sources and their completion entries (and with them
+        # their extra fields) are deleted, leaving member profiles, other
+        # activities and top-level extra fields untouched.
+        target["participants"] = roster
+        if merged_completions:
+            data.setdefault("completions", {})[target_activity_id] = merged_completions
+        for source_activity_id in source_ids:
+            del activities[source_activity_id]
+            completions.pop(source_activity_id, None)
+        self._write(data)
+        return target
+
     def activities(self):
         return sorted(self._read().get("activities", {}).values(), key=lambda a: (a["on"], a["activity_id"]))
 
