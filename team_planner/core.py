@@ -1334,6 +1334,188 @@ class TeamPlanner(JsonStore):
             })
         return {"as_of": as_of, "required_count": len(selected_groups), "members": rows}
 
+    def training_validity_timeline(self, groups, from_on, to_on, member_ids=None):
+        # Read-only interval view of training_validity: for every day of the
+        # closed from_on..to_on range the group result is exactly what
+        # training_validity would return for that day, and consecutive days
+        # carrying the same status, activity_id and completed_on are merged
+        # into the longest closed periods. As in training_validity the groups
+        # exist only for this call, current rosters and profiles are used as
+        # they are, historical rosters and the current date are never
+        # consulted, and a future record never masks an older one.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        selected_groups = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids", "valid_days"}:
+                raise ValueError("each group must contain only group_id, activity_ids and valid_days")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group_ids must not contain duplicates")
+            seen_groups.add(group_id)
+            valid_days = positive(item["valid_days"], "valid_days")
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            group_activities = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # As in training_validity, an activity belongs to exactly one
+                # group and may not repeat inside it.
+                if activity_id in seen_activities:
+                    raise ValueError("activity_ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                group_activities.append(activity_id)
+            selected_groups.append((group_id, group_activities, valid_days))
+        from_on = day(from_on, "from_on")
+        to_on = day(to_on, "to_on")
+        if from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        # member_ids follows training_validity exactly: omitted or null means
+        # every member, an empty array means no members at all.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        for _, activity_ids, _ in selected_groups:
+            for activity_id in activity_ids:
+                if activities.get(activity_id) is None:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        start = date.fromisoformat(from_on)
+        end = date.fromisoformat(to_on)
+        start_ord = start.toordinal()
+        end_ord = end.toordinal()
+        # Ordinals avoid date arithmetic past 9999-12-31: a validity window
+        # longer than the queried range simply stays valid throughout it
+        # instead of raising OverflowError.
+        max_ordinal = date.max.toordinal()
+        rows = []
+        for member_id in ordered_member_ids:
+            group_rows = []
+            for group_id, activity_ids, valid_days in selected_groups:
+                enrolled_any = False
+                # Every own completion of the group's sessions is gathered
+                # once; the selection only admits records not later than the
+                # day being judged, so future records never participate or
+                # mask older ones.
+                records = []
+                for activity_id in activity_ids:
+                    activity = activities[activity_id]
+                    if member_id not in activity.get("participants", []):
+                        continue
+                    enrolled_any = True
+                    completed_on = completions.get(activity_id, {}).get(member_id)
+                    if completed_on is not None:
+                        records.append((completed_on, activity["on"], activity_id))
+
+                def pick(eligible):
+                    # Exactly training_validity's tie break: the latest
+                    # completion date wins; equal dates break by activity date
+                    # and activity id, both ascending.
+                    latest_completed = max(record[0] for record in eligible)
+                    return min(record for record in eligible if record[0] == latest_completed)
+
+                periods = []
+
+                def add_period(begin_ord, bound_ord, record):
+                    # Emit the maximal run covering [begin_ord, bound_ord] for
+                    # one fixed picked record, splitting at the validity end.
+                    if record is None:
+                        values = ("pending" if enrolled_any else "not_enrolled", None, None)
+                        ends = [(bound_ord, values)]
+                    else:
+                        completed_on, _, picked_activity_id = record
+                        expiry_ord = date.fromisoformat(completed_on).toordinal() + valid_days
+                        if expiry_ord > max_ordinal:
+                            expiry_ord = max_ordinal + 1
+                        valid_values = ("valid", picked_activity_id, completed_on)
+                        expired_values = ("expired", picked_activity_id, completed_on)
+                        if begin_ord < expiry_ord:
+                            ends = [(min(bound_ord, expiry_ord - 1), valid_values)]
+                            if expiry_ord <= bound_ord:
+                                ends.append((bound_ord, expired_values))
+                        else:
+                            ends = [(bound_ord, expired_values)]
+                    for segment_end_ord, values in ends:
+                        period = {
+                            "from_on": date.fromordinal(begin_ord).isoformat(),
+                            "to_on": date.fromordinal(segment_end_ord).isoformat(),
+                            "status": values[0],
+                            "activity_id": values[1],
+                            "completed_on": values[2],
+                        }
+                        # Consecutive days with the same status, activity and
+                        # completion date make one longest period; a changed
+                        # completion basis always starts a new segment even
+                        # when the status is unchanged.
+                        if periods and all(
+                            periods[-1][key] == period[key]
+                            for key in ("status", "activity_id", "completed_on")
+                        ):
+                            periods[-1]["to_on"] = period["to_on"]
+                        else:
+                            periods.append(period)
+                        begin_ord = segment_end_ord + 1
+
+                if records:
+                    # The picked record only changes on a completion date that
+                    # enters the day's cutoff. The first run already accounts
+                    # for every record completed on or before the range start;
+                    # later in-range completion dates each restart the run.
+                    current = pick([
+                        record for record in records
+                        if date.fromisoformat(record[0]).toordinal() <= start_ord
+                    ]) if any(
+                        date.fromisoformat(record[0]).toordinal() <= start_ord for record in records
+                    ) else None
+                    cursor_ord = start_ord
+                    future_events = sorted({
+                        date.fromisoformat(record[0]).toordinal()
+                        for record in records
+                        if start_ord < date.fromisoformat(record[0]).toordinal() <= end_ord
+                    })
+                    for event_ord in future_events:
+                        add_period(cursor_ord, event_ord - 1, current)
+                        current = pick([
+                            record for record in records
+                            if date.fromisoformat(record[0]).toordinal() <= event_ord
+                        ])
+                        cursor_ord = event_ord
+                    add_period(cursor_ord, end_ord, current)
+                else:
+                    # No records at all: the status is constant over the range.
+                    add_period(start_ord, end_ord, None)
+                group_rows.append({"group_id": group_id, "periods": periods})
+            rows.append({
+                "member_id": member_id,
+                "name": members[member_id]["name"],
+                "groups": group_rows,
+            })
+        return {"from_on": from_on, "to_on": to_on, "members": rows}
+
     def training_alerts(self, groups, as_of, through_on, member_ids=None):
         # Read-only alert view over the same ephemeral training groups as
         # training_validity: the record picked per member and group follows the
