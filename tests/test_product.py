@@ -5048,6 +5048,137 @@ class ProductTests(unittest.TestCase):
             "M-004", 1, ["M-001", "M-002", "M-004"])
         self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
 
+    def _exclusive_start_options_ready(self):
+        # 小陈和小林凭 A-ONE、A-TWO 的双份完成记录在两个组均持续合格（有效期
+        # 极长）；小周和小吴只报名第一组的 A-ONE、暂无完成记录，之后按需补登。
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.add_member("M-003", "小周")
+        self.app.add_member("M-004", "小吴")
+        self.app.create_activity("A-ONE", "第一组培训", "2026-10-10", 4)
+        self.app.create_activity("A-TWO", "第二组培训", "2026-10-10", 2)
+        for activity_id in ("A-ONE", "A-TWO"):
+            for member_id in ("M-001", "M-002"):
+                self.app.enroll(activity_id, member_id)
+                self.app.record_completion(activity_id, member_id, "2026-10-10")
+        self.app.enroll("A-ONE", "M-003")
+        self.app.enroll("A-ONE", "M-004")
+
+    def _exclusive_start_groups(self, one_count=1, two_count=1, valid_days=10**6):
+        return [
+            {"group_id": "G-ONE", "activity_ids": ["A-ONE"], "valid_days": valid_days, "minimum_count": one_count},
+            {"group_id": "G-TWO", "activity_ids": ["A-TWO"], "valid_days": valid_days, "minimum_count": two_count},
+        ]
+
+    def test_group_absence_start_options_exclusive_example(self):
+        self._exclusive_start_options_ready()
+        groups = self._exclusive_start_groups()
+        # 题面示例：小陈和小林在两组均有效且无人请假，两组各需一人。小陈请两
+        # 天时默认口径下每组仍各余小林一人，窗口为 15 至 18 日；省略与显式
+        # false 的结果与默认完全一致，结果字段不变。
+        expected = {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-19",
+            "member_id": "M-001",
+            "days": 2,
+            "start_windows": [{"from_on": "2026-10-15", "to_on": "2026-10-18"}],
+        }
+        self.assertEqual(self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 2), expected)
+        self.assertEqual(self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, False), expected)
+        # 开启独占核对后小陈整段离岗，每天只剩小林一人，无法同时填满两岗，
+        # 窗口为空。
+        exclusive = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        self.assertEqual(exclusive, {**expected, "start_windows": []})
+        # 增加仅第一组有效的小周后：小周承担第一组、小林承担第二组，独占模式
+        # 也返回 15 至 18 日的窗口，不因先把小林计入第一组而拒绝可行日期。
+        self.app.record_completion("A-ONE", "M-003", "2026-10-10")
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        self.assertEqual(result, expected)
+
+    def test_group_absence_start_options_exclusive_shared_pool(self):
+        self._exclusive_start_options_ready()
+        groups = self._exclusive_start_groups()
+        # 小陈请一天时每天只剩小林一人：两组各自需求都是一人、合计需求两人，
+        # 各组独立人数足够与总人数足够都不能代替同时满足，独占模式没有可行
+        # 起日。申请人换成两组都不合格的小周（仅报名未完成）时他从不扣人，
+        # 小陈、小林每天可分任两岗，全部起日可行。
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 1, None, True)
+        self.assertEqual(result["start_windows"], [])
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-003", 1, None, True)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+        # 小周仅第一组有效后，本人已在 absences 中请假时不重复扣人：小陈全程
+        # 已请假，他的候选请假不再使人员池缩小，每天小林、小周仍分任两岗，
+        # 全部起日可行。
+        self.app.record_completion("A-ONE", "M-003", "2026-10-10")
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19",
+            [{"member_id": "M-001", "from_on": "2026-10-15", "to_on": "2026-10-19"}],
+            "M-001", 1, None, True)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+        # 不同日期可以采用不同分配：小林 17 日已请假，当天只剩小周（仅第一组
+        # 有效），第二组无人能填；候选段不覆盖 17 日的起日不受影响。请一天时
+        # 起日 15、16、18、19 可行，请两天时只有 15 与 18。
+        absences = [{"member_id": "M-002", "from_on": "2026-10-17", "to_on": "2026-10-17"}]
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", absences, "M-001", 1, None, True)
+        self.assertEqual(result["start_windows"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-16"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-19"},
+        ])
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", absences, "M-001", 2, None, True)
+        self.assertEqual(result["start_windows"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-18"},
+        ])
+
+    def test_group_absence_start_options_exclusive_total_headcount_not_enough(self):
+        self._exclusive_start_options_ready()
+        groups = self._exclusive_start_groups()
+        # 总人数足够也不能代替同时满足：小周和小吴都仅第一组有效，小林全程已
+        # 请假、小陈申请离岗后，每天人员池恰有两人、等于需求总数，但第二组无
+        # 人可承担，独占模式没有可行起日。
+        self.app.record_completion("A-ONE", "M-003", "2026-10-10")
+        self.app.record_completion("A-ONE", "M-004", "2026-10-10")
+        absences = [{"member_id": "M-002", "from_on": "2026-10-15", "to_on": "2026-10-19"}]
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", absences, "M-001", 1, None, True)
+        self.assertEqual(result["start_windows"], [])
+        # 小林不请假时人员池为三人，第一组两人、第二组一人可同时填满，全部
+        # 起日可行；独占可行时默认口径必然同样可行。
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 1, None, True)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 1)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+
+    def test_group_absence_start_options_exclusive_never_writes(self):
+        self._exclusive_start_options_ready()
+        groups = self._exclusive_start_groups()
+        before = self.app.path.read_bytes()
+        self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        with self.assertRaises(ValueError):
+            self.app.group_absence_start_options(
+                groups, "2026-10-15", "2026-10-19", [], "GHOST", 2, None, True)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 缺少 completions 的旧数据按无记录处理：无人合格，独占与默认口径
+        # 都没有可行起日，也不补写字段。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-001", 1, None, True)
+        self.assertEqual(result["start_windows"], [])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+
     def test_group_absence_start_options_rejections(self):
         self._group_start_options_ready()
         valid_groups = self._group_start_groups()
@@ -5134,11 +5265,16 @@ class ProductTests(unittest.TestCase):
         # 不接受顶层人数参数，也没有待完成培训筛选参数。
         with self.assertRaises(TypeError):
             self.app.group_absence_start_options(valid_groups, "2026-10-15", "2026-10-19",
-                                                 valid_absences, "M-001", 2, None, 1)
+                                                 valid_absences, "M-001", 2, None, False, 1)
         with self.assertRaises(TypeError):
             self.app.group_absence_start_options(valid_groups, "2026-10-15", "2026-10-19",
                                                  valid_absences, "M-001", 2,
                                                  avoid_pending_training=True)
+        # exclusive 非布尔值（含 null、数字和字符串）统一拒绝。
+        for exclusive in [None, 0, 1, 1.0, "true", ""]:
+            with self.assertRaises(ValueError, msg=exclusive):
+                self.app.group_absence_start_options(valid_groups, "2026-10-15", "2026-10-19",
+                                                     valid_absences, "M-001", 2, None, exclusive)
 
     def test_group_absence_start_options_never_writes_and_legacy_data(self):
         self._group_start_options_ready()
@@ -5225,6 +5361,46 @@ class ProductTests(unittest.TestCase):
              "from_on": "2026-10-15", "to_on": "2026-10-19", "absences": [],
              "member_id": "M-001", "days": 0},
         ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_group_absence_start_options_exclusive(self):
+        self._exclusive_start_options_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root),
+                                   "group-absence-start-options", name], text=True, capture_output=True)
+        base = {"groups": self._exclusive_start_groups(),
+                "from_on": "2026-10-15", "to_on": "2026-10-19", "absences": [],
+                "member_id": "M-001", "days": 2}
+        before = self.app.path.read_bytes()
+        # 省略与显式 false 的结果一致：窗口为 15 至 18 日。
+        for payload in (base, {**base, "exclusive": False}):
+            ok = run(payload)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertEqual(json.loads(ok.stdout), {
+                "from_on": "2026-10-15",
+                "to_on": "2026-10-19",
+                "member_id": "M-001",
+                "days": 2,
+                "start_windows": [{"from_on": "2026-10-15", "to_on": "2026-10-18"}],
+            })
+        # 开启独占核对后每天只剩小林一人，无法同时填满两岗，窗口为空。
+        exclusive = run({**base, "exclusive": True})
+        self.assertEqual(exclusive.returncode, 0, exclusive.stderr)
+        self.assertEqual(json.loads(exclusive.stdout)["start_windows"], [])
+        # 非布尔值（含 null、数字和字符串）失败：标准输出为空、标准错误含
+        # error 的 JSON 并返回 2；顶层数组逐项执行，出错即停。
+        for value in ("true", 1, None):
+            bad = run({**base, "exclusive": value})
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("error", json.loads(bad.stderr))
+            self.assertEqual(bad.stdout, "")
+        partial = run([{**base, "exclusive": True}, {**base, "exclusive": None}])
         self.assertEqual(partial.returncode, 2)
         self.assertIn("error", json.loads(partial.stderr))
         self.assertEqual(partial.stdout, "")
