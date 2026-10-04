@@ -2238,12 +2238,14 @@ class TeamPlanner(JsonStore):
             ],
         }
 
-    def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None):
+    def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None, avoid_pending_training=False):
         # Read-only start-date recommendation over preview_absence_coverage:
         # the qualified and absent members per day are computed exactly as
         # there, and on top of that one ephemeral leave of `days` consecutive
         # calendar days for one selected member is tried at every possible
-        # start date. The leave exists only for this call: nothing is ever
+        # start date. With avoid_pending_training, a start is additionally
+        # rejected whenever the leave would cover a pending training of the
+        # leave taker. The leave exists only for this call: nothing is ever
         # stored, and enrollments, completion records and profiles are used as
         # they are, never reconstructed historically; the current date is
         # never consulted.
@@ -2298,6 +2300,10 @@ class TeamPlanner(JsonStore):
         member_id = text(member_id, "member_id")
         # The leave length is a non-boolean positive integer of calendar days.
         days = positive(days, "days")
+        # The pending-training filter is an optional strict boolean; null,
+        # numbers and strings are rejected exactly like available_only.
+        if type(avoid_pending_training) is not bool:
+            raise ValueError("avoid_pending_training must be a boolean")
         # member_ids follows preview_absence_coverage exactly: omitted or null
         # means every member, an empty array means no members at all.
         if member_ids is None:
@@ -2413,10 +2419,31 @@ class TeamPlanner(JsonStore):
             if frm <= to:
                 absent[absence_member_id].append((frm, to))
 
+        # With avoid_pending_training, a day also breaks every candidate leave
+        # covering it when the leave taker has a pending training that day.
+        # Pending matches schedule exactly: every activity the member is
+        # currently enrolled in, regardless of the queried groups, without an
+        # own completion record. A record dated even beyond the query range
+        # clears it; other members' enrollments and activities the member is
+        # not enrolled in never block. Activities outside the range are
+        # irrelevant because no candidate leave can cover them. Several
+        # pending activities on one day block that day only once.
+        pending_days = set()
+        if avoid_pending_training:
+            for activity in activities.values():
+                if member_id not in activity.get("participants", []):
+                    continue
+                if completions.get(activity["activity_id"], {}).get(member_id) is not None:
+                    continue
+                on = date.fromisoformat(activity["on"])
+                if start <= on <= end:
+                    pending_days.add(on)
+
         # Sweep the range exactly as in preview_absence_coverage: the
         # qualified set or the absent set can only change where one of the
         # intervals starts or ends, so the days between consecutive edges
-        # share both sets. Every edge lies inside the range, so no date
+        # share both sets. Pending training days add their own edges so each
+        # is judged separately. Every edge lies inside the range, so no date
         # overflows.
         edges = set()
         for intervals in qualified:
@@ -2431,11 +2458,18 @@ class TeamPlanner(JsonStore):
                     edges.add(frm)
                 if to < end:
                     edges.add(to + timedelta(days=1))
+        for on in pending_days:
+            if on > start:
+                edges.add(on)
+            if on < end:
+                edges.add(on + timedelta(days=1))
         boundaries = [start] + sorted(edges)
-        # Maximal runs of days on which the candidate leave would break the
-        # headcount: the leave taker only deducts when they are qualified and
-        # not already absent that day, and only the days inside the candidate
-        # leave are judged, so gaps elsewhere never affect a candidate.
+        # Maximal runs of days on which the candidate leave is infeasible:
+        # either it would break the headcount, or the day holds a pending
+        # training of the leave taker. For the headcount rule the leave taker
+        # only deducts when they are qualified and not already absent that
+        # day, and only the days inside the candidate leave are judged, so
+        # gaps elsewhere never affect a candidate.
         bad = []
         for index, frm in enumerate(boundaries):
             to = boundaries[index + 1] - timedelta(days=1) if index + 1 < len(boundaries) else end
@@ -2448,8 +2482,10 @@ class TeamPlanner(JsonStore):
             # The leave taker only deducts when they are qualified and not
             # already absent that day; only the days inside the candidate
             # leave are judged, so gaps elsewhere never affect a candidate.
+            # A pending training of the applicant blocks regardless of their
+            # qualification or existing absence that day.
             available = len(available_ids) - (1 if member_id in available_ids else 0)
-            if available < minimum_count:
+            if available < minimum_count or frm in pending_days:
                 if bad and bad[-1][1] == frm - timedelta(days=1):
                     bad[-1][1] = to
                 else:
