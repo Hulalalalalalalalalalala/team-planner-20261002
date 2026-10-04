@@ -2800,7 +2800,7 @@ class TeamPlanner(JsonStore):
             ],
         }
 
-    def group_absence_start_options(self, groups, from_on, to_on, absences=None, member_id=None, days=None, member_ids=None):
+    def group_absence_start_options(self, groups, from_on, to_on, absences=None, member_id=None, days=None, member_ids=None, exclusive=False):
         # Read-only per-group start-date recommendation over group_coverage:
         # the qualified and absent members per day and the per-group
         # headcount requirements are computed exactly as there, and on top
@@ -2809,7 +2809,12 @@ class TeamPlanner(JsonStore):
         # group is judged on its own: the leave taker only deducts from a
         # group on a day when that group alone is valid for them and they are
         # not already absent; the same member may keep counting in the other
-        # groups. The groups, absences and leave exist only for this call:
+        # groups. With exclusive, each day is instead judged as one shared
+        # staffing pool exactly as in exclusive_group_coverage: the same
+        # member fills at most one group's positions that day and every group
+        # fills at most its own minimum_count, so a start is recommended only
+        # when every day of the candidate leave can fill all groups at once.
+        # The groups, absences and leave exist only for this call:
         # nothing is ever stored, enrollments, completion records and
         # profiles are used as they are, never reconstructed historically,
         # and the current date is never consulted.
@@ -2866,6 +2871,10 @@ class TeamPlanner(JsonStore):
         member_id = text(member_id, "member_id")
         # The leave length is a non-boolean positive integer of calendar days.
         days = positive(days, "days")
+        # The shared-pool check is an optional strict boolean; null, numbers
+        # and strings are rejected exactly like available_only.
+        if type(exclusive) is not bool:
+            raise ValueError("exclusive must be a boolean")
         # member_ids follows group_coverage exactly: omitted or null means
         # every member, an empty array means no members at all.
         if member_ids is None:
@@ -2988,21 +2997,70 @@ class TeamPlanner(JsonStore):
         bad = []
         for index, frm in enumerate(boundaries):
             to = boundaries[index + 1] - timedelta(days=1) if index + 1 < len(boundaries) else end
-            day_is_bad = False
-            for group_index, (_, _, _, minimum_count) in enumerate(selected_groups):
-                available_ids = [
+            # Per group, the members qualified for that group alone and not
+            # already absent that day, exactly group_coverage's available
+            # lists; the leave taker is then removed for the candidate leave.
+            available_per_group = [
+                [
                     member
                     for member, per_group in zip(ordered_member_ids, qualified)
                     if any(f <= frm <= t for f, t in per_group[group_index])
                     and not any(f <= frm <= t for f, t in absent[member])
                 ]
-                # The leave taker only deducts from this group when they are
-                # qualified for it and not already absent that day; being
-                # unqualified or already away costs the group nothing.
-                available = len(available_ids) - (1 if member_id in available_ids else 0)
-                if available < minimum_count:
-                    day_is_bad = True
-                    break
+                for group_index in range(len(selected_groups))
+            ]
+            if exclusive:
+                # Shared-pool staffing exactly as in exclusive_group_coverage:
+                # the leave taker's candidate absence is unioned with the
+                # existing ones, so they simply leave the pool (an existing
+                # absence already removed them — they are never deducted
+                # twice). Every remaining member fills at most one group's
+                # positions that day and each group fills at most its own
+                # minimum_count. The largest simultaneously fillable number
+                # of positions is a bipartite matching between the available
+                # members and the group positions, found by augmenting paths:
+                # a day is rejected only when NO assignment fills every
+                # group, never because one particular assignment failed, and
+                # each day is matched on its own, so different days may use
+                # different assignments. Only the size matters; the
+                # assignment itself is discarded.
+                available = [
+                    [member for member in available_per_group[group_index] if member != member_id]
+                    for group_index in range(len(selected_groups))
+                ]
+                assignment = {}
+
+                def augment(group_index, seen):
+                    for member in available[group_index]:
+                        if member in seen:
+                            continue
+                        seen.add(member)
+                        if member not in assignment or augment(assignment[member], seen):
+                            assignment[member] = group_index
+                            return True
+                    return False
+
+                filled = 0
+                for group_index, (_, _, _, minimum_count) in enumerate(selected_groups):
+                    for _ in range(minimum_count):
+                        if not augment(group_index, set()):
+                            break
+                        filled += 1
+                # Every group must be fillable at once: each group having
+                # enough members on its own, or the pool being big enough in
+                # total, does not replace the simultaneous check.
+                day_is_bad = filled < sum(minimum_count for _, _, _, minimum_count in selected_groups)
+            else:
+                day_is_bad = False
+                for group_index, (_, _, _, minimum_count) in enumerate(selected_groups):
+                    available_ids = available_per_group[group_index]
+                    # The leave taker only deducts from this group when they are
+                    # qualified for it and not already absent that day; being
+                    # unqualified or already away costs the group nothing.
+                    available = len(available_ids) - (1 if member_id in available_ids else 0)
+                    if available < minimum_count:
+                        day_is_bad = True
+                        break
             if day_is_bad:
                 if bad and bad[-1][1] == frm - timedelta(days=1):
                     bad[-1][1] = to

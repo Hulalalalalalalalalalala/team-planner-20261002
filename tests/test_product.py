@@ -4933,6 +4933,85 @@ class ProductTests(unittest.TestCase):
             self._group_start_groups(collab_count=2), "2026-10-15", "2026-10-19", [], "M-004", 1)
         self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
 
+    def _exclusive_start_options_ready(self):
+        # 小陈和小林在两组均长期有效；小周、小吴稍后按需加入。
+        self.app.add_member("M-001", "小陈")
+        self.app.add_member("M-002", "小林")
+        self.app.create_activity("A-SAFE", "安全培训", "2026-10-10", 5)
+        self.app.create_activity("A-COLLAB", "协作培训", "2026-10-10", 5)
+        for member_id in ("M-001", "M-002"):
+            self.app.enroll("A-SAFE", member_id)
+            self.app.enroll("A-COLLAB", member_id)
+            self.app.record_completion("A-SAFE", member_id, "2026-10-10")
+            self.app.record_completion("A-COLLAB", member_id, "2026-10-10")
+
+    def test_group_absence_start_options_exclusive_shared_pool(self):
+        self._exclusive_start_options_ready()
+        groups = self._group_start_groups(valid_days=10**6)
+        # 题面示例：两组各需一人且无人已有请假，小陈请两天时默认口径两组
+        # 各自核对，每组都还剩小林，窗口为 2026-10-15 至 2026-10-18。
+        expected = [{"from_on": "2026-10-15", "to_on": "2026-10-18"}]
+        result = self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2)
+        self.assertEqual(result["start_windows"], expected)
+        # 显式 False 与省略完全一致。
+        result = self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, False)
+        self.assertEqual(result["start_windows"], expected)
+        # 开启独占核对后每天只剩小林一人，无法同时填两组的岗位，窗口为空。
+        result = self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        self.assertEqual(result["start_windows"], [])
+        # 增加仅第一组有效的小周后，小周填安全组、小林填协作组，独占模式
+        # 也返回 2026-10-15 至 2026-10-18。
+        self.app.add_member("M-003", "小周")
+        self.app.enroll("A-SAFE", "M-003")
+        self.app.record_completion("A-SAFE", "M-003", "2026-10-10")
+        result = self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        self.assertEqual(result["start_windows"], expected)
+
+    def test_group_absence_start_options_exclusive_matching(self):
+        self._exclusive_start_options_ready()
+        self.app.add_member("M-003", "小周")
+        self.app.enroll("A-SAFE", "M-003")
+        self.app.record_completion("A-SAFE", "M-003", "2026-10-10")
+        self.app.add_member("M-004", "小吴")
+        groups = self._group_start_groups(valid_days=10**6)
+        everyone = ["M-001", "M-002", "M-003", "M-004"]
+        # 一种分配失败不能拒绝可行日期：安全组可选小陈或小周、协作组只能选
+        # 小陈（小林 17 日请假），若先把小陈计入安全组则协作组无人；换为
+        # 小周承担安全组即可同时填满，17 日依旧可行。
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19",
+            [{"member_id": "M-002", "from_on": "2026-10-17", "to_on": "2026-10-17"}],
+            "M-004", 1, everyone, True)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+        # 本人已请假时不重复扣人：小陈全程已请假，池中仍剩小林与小周两人，
+        # 分别承担两组，小吴的单日请假全程可行。
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19",
+            [{"member_id": "M-001", "from_on": "2026-10-15", "to_on": "2026-10-19"}],
+            "M-004", 1, everyone, True)
+        self.assertEqual(result["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-19"}])
+        # 各组独立人数或总人数足够都不能代替同时满足判断：小陈、小林都
+        # 只能承担协作组时安全组无人可填，即使池中有两人也不可行。
+        self.app.correct_completions([
+            {"activity_id": "A-SAFE", "member_id": "M-001", "completed_on": None},
+            {"activity_id": "A-SAFE", "member_id": "M-002", "completed_on": None},
+        ])
+        result = self.app.group_absence_start_options(
+            groups, "2026-10-15", "2026-10-19", [], "M-004", 1, ["M-001", "M-002", "M-004"], True)
+        self.assertEqual(result["start_windows"], [])
+
+    def test_group_absence_start_options_exclusive_never_writes(self):
+        self._exclusive_start_options_ready()
+        groups = self._group_start_groups(valid_days=10**6)
+        before = self.app.path.read_bytes()
+        self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        with self.assertRaises(ValueError):
+            self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, 1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 结果字段与默认口径完全一致，不新增人数字段。
+        result = self.app.group_absence_start_options(groups, "2026-10-15", "2026-10-19", [], "M-001", 2, None, True)
+        self.assertEqual(set(result), {"from_on", "to_on", "member_id", "days", "start_windows"})
+
     def test_group_absence_start_options_no_deduction_when_unqualified_or_absent(self):
         self._group_start_options_ready()
         # 申请人在两组都不合格时从不扣人：基线每天两组各有两人满足一人要求，
@@ -5134,11 +5213,16 @@ class ProductTests(unittest.TestCase):
         # 不接受顶层人数参数，也没有待完成培训筛选参数。
         with self.assertRaises(TypeError):
             self.app.group_absence_start_options(valid_groups, "2026-10-15", "2026-10-19",
-                                                 valid_absences, "M-001", 2, None, 1)
+                                                 valid_absences, "M-001", 2, None, False, 1)
         with self.assertRaises(TypeError):
             self.app.group_absence_start_options(valid_groups, "2026-10-15", "2026-10-19",
                                                  valid_absences, "M-001", 2,
                                                  avoid_pending_training=True)
+        # exclusive 必须是严格布尔：null、数字和字符串都被拒绝，1 不算 true。
+        for exclusive in [None, 0, 1, 0.0, 1.0, "true", ""]:
+            with self.assertRaises(ValueError, msg=exclusive):
+                self.app.group_absence_start_options(valid_groups, "2026-10-15", "2026-10-19",
+                                                     valid_absences, "M-001", 2, None, exclusive)
 
     def test_group_absence_start_options_never_writes_and_legacy_data(self):
         self._group_start_options_ready()
