@@ -2515,6 +2515,127 @@ class TeamPlanner(JsonStore):
             period["meets_requirements"] = filled == required
         return result
 
+    def preview_group_assignments(self, groups, from_on, to_on, absences=None, member_ids=None):
+        # Read-only staffing suggestion over exclusive_group_coverage: the
+        # inputs, validation, per-group lists and figures, the period
+        # splitting and merging and the shared-pool headcount are exactly
+        # exclusive_group_coverage's; on top of that each period also gets a
+        # concrete assignment of available members to group positions — each
+        # member fills at most one group's position per day, only members
+        # valid and not absent for a group that day may enter it, and each
+        # group receives at most its own minimum_count members. The
+        # assignment is only a suggestion: nothing is ever stored, the groups
+        # and absences exist only for this call, and the current date is
+        # never consulted.
+        result = self.exclusive_group_coverage(groups, from_on, to_on, absences, member_ids)
+        # The member selection list fixes every position: the input order of
+        # member_ids, or ascending identifiers when no members are named. The
+        # coverage call above has already normalized and checked the
+        # selection, so this cannot fail.
+        if member_ids is None:
+            ordered_member_ids = sorted(self._read().get("members", {}))
+        else:
+            ordered_member_ids = [text(member_id, "member_id") for member_id in member_ids]
+        position = {member_id: index for index, member_id in enumerate(ordered_member_ids)}
+        for period in result["periods"]:
+            per_group = period["groups"]
+            demands = [group["minimum_count"] for group in per_group]
+            available = [group["available_member_ids"] for group in per_group]
+            eligible = [set(ids) for ids in available]
+            target = period["filled_count"]
+            group_count = len(per_group)
+            forced = {}
+            forbidden = set()
+
+            def max_filled():
+                # The largest simultaneous fill consistent with the
+                # assignments forced and forbidden so far; None when a forced
+                # assignment is itself impossible. The same augmenting-path
+                # matching as exclusive_group_coverage, with forced members
+                # removed from the pool and their groups' capacities reduced.
+                used = [0] * group_count
+                for member_id, group_index in forced.items():
+                    if member_id not in eligible[group_index] or (member_id, group_index) in forbidden:
+                        return None
+                    used[group_index] += 1
+                    if used[group_index] > demands[group_index]:
+                        return None
+                assignment = {}
+
+                def augment(group_index, seen):
+                    for member_id in available[group_index]:
+                        if member_id in forced or (member_id, group_index) in forbidden or member_id in seen:
+                            continue
+                        seen.add(member_id)
+                        if member_id not in assignment or augment(assignment[member_id], seen):
+                            assignment[member_id] = group_index
+                            return True
+                    return False
+
+                total = len(forced)
+                for group_index in range(group_count):
+                    for _ in range(demands[group_index] - used[group_index]):
+                        if not augment(group_index, set()):
+                            break
+                        total += 1
+                return total
+
+            # The suggestion first maximizes the simultaneously filled total
+            # (never trading the total away to favour an earlier group), then,
+            # among all maximum assignments, minimizes the position sequences
+            # of the chosen members in the selection list: each group's
+            # sequence is ascending and padded up to its requirement with
+            # empty slots placed after every member, and the padded sequences
+            # are concatenated in group input order for the lexicographic
+            # comparison. Building each sequence slot by slot and keeping the
+            # smallest position that still allows a maximum-total completion
+            # yields exactly that minimum; the returned arrays drop the
+            # padding.
+            assigned = [[] for _ in range(group_count)]
+            for group_index in range(group_count):
+                last = -1
+                for _ in range(demands[group_index]):
+                    chosen = None
+                    for member_id in ordered_member_ids:
+                        pos = position[member_id]
+                        if pos <= last or member_id in forced or (member_id, group_index) in forbidden:
+                            continue
+                        if member_id not in eligible[group_index]:
+                            continue
+                        # Committing to this position rules out every skipped
+                        # member for this group: the sequence stays ascending.
+                        added = [
+                            (other, group_index)
+                            for other in ordered_member_ids
+                            if last < position[other] < pos and (other, group_index) not in forbidden
+                        ]
+                        forbidden.update(added)
+                        forced[member_id] = group_index
+                        if max_filled() == target:
+                            chosen = member_id
+                            break
+                        for pair in added:
+                            forbidden.discard(pair)
+                        del forced[member_id]
+                    if chosen is None:
+                        # An empty slot: nobody else may enter this group. A
+                        # maximum-total completion always exists here, because
+                        # the state before this slot had one and it assigns
+                        # nobody more to this group.
+                        for other in ordered_member_ids:
+                            if position[other] > last and other not in forced:
+                                forbidden.add((other, group_index))
+                        break
+                    assigned[group_index].append(chosen)
+                    last = position[chosen]
+            # The per-group assigned counts add up to the period's
+            # filled_count and the unfilled counts to its shortage_count.
+            for group, group_assigned in zip(per_group, assigned):
+                group["assigned_member_ids"] = group_assigned
+                group["assigned_count"] = len(group_assigned)
+                group["unfilled_count"] = group["minimum_count"] - len(group_assigned)
+        return result
+
     def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None, avoid_pending_training=False):
         # Read-only start-date recommendation over preview_absence_coverage:
         # the qualified and absent members per day are computed exactly as
