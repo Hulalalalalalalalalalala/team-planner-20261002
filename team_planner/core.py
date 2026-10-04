@@ -2468,6 +2468,53 @@ class TeamPlanner(JsonStore):
             ],
         }
 
+    def exclusive_group_coverage(self, groups, from_on, to_on, absences=None, member_ids=None):
+        # Read-only shared-pool staffing check over group_coverage: the
+        # inputs, validation, per-group lists and figures, and the period
+        # splitting and merging are exactly group_coverage's, but on top of
+        # that each period is also judged as one shared staffing pool for the
+        # day — the same member fills at most one group's position per day
+        # and each group fills at most its own minimum_count positions. The
+        # assignment is only used for the headcount and is never stored; the
+        # groups and absences exist only for this call, nothing is ever
+        # written, and the current date is never consulted.
+        result = self.group_coverage(groups, from_on, to_on, absences, member_ids)
+        for period in result["periods"]:
+            per_group = period["groups"]
+            required = sum(group["minimum_count"] for group in per_group)
+            # The largest number of simultaneously fillable positions is a
+            # bipartite matching between the available members (each usable
+            # in at most one group) and the group positions (each group
+            # capped at its own requirement), found by augmenting paths.
+            # Only the size matters; the assignment itself is discarded.
+            available = [group["available_member_ids"] for group in per_group]
+            assignment = {}
+
+            def augment(group_index, seen):
+                for member_id in available[group_index]:
+                    if member_id in seen:
+                        continue
+                    seen.add(member_id)
+                    if member_id not in assignment or augment(assignment[member_id], seen):
+                        assignment[member_id] = group_index
+                        return True
+                return False
+
+            filled = 0
+            for group_index, group in enumerate(per_group):
+                for _ in range(group["minimum_count"]):
+                    if not augment(group_index, set()):
+                        break
+                    filled += 1
+            period["required_count"] = required
+            period["filled_count"] = filled
+            period["shortage_count"] = required - filled
+            # Only a period whose positions can all be filled at once meets
+            # the requirements; every group individually having enough
+            # available members is not sufficient on its own.
+            period["meets_requirements"] = filled == required
+        return result
+
     def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None, avoid_pending_training=False):
         # Read-only start-date recommendation over preview_absence_coverage:
         # the qualified and absent members per day are computed exactly as
