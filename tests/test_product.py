@@ -3884,6 +3884,351 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _group_coverage_ready(self):
+        # 与 _absence_ready 相同的基础数据，另让小林 2026-10-15 完成入门二：
+        # 小陈仅安全组（A-001）有效，小林仅协作组（A-002）有效。
+        self._absence_ready()
+        self.app.record_completion("A-002", "M-002", "2026-10-15")
+
+    def test_group_coverage_example(self):
+        self._group_coverage_ready()
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        # 2026-10-15 小陈仅安全组有效、小林仅协作组有效，两组各需一人且无人
+        # 请假：两组均无欠缺，整体满足要求。
+        result = self.app.group_coverage(groups, "2026-10-15", "2026-10-15", [])
+        self.assertEqual(result, {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-15",
+            "periods": [{
+                "from_on": "2026-10-15",
+                "to_on": "2026-10-15",
+                "groups": [
+                    {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                     "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                    {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002"], "valid_count": 1,
+                     "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+                ],
+                "meets_requirements": True,
+            }],
+        })
+        # 小陈当天请假后安全组欠缺一人，整体不满足；协作组不受影响。
+        absent = self.app.group_coverage(groups, "2026-10-15", "2026-10-15",
+                                         [{"member_id": "M-001", "from_on": "2026-10-15", "to_on": "2026-10-15"}])
+        self.assertEqual(absent["periods"], [{
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-15",
+            "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": ["M-001"], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+            ],
+            "meets_requirements": False,
+        }])
+
+    def test_group_coverage_shared_member_counts_in_each_group(self):
+        self._group_coverage_ready()
+        # 小陈在 A-001（10-15 完成）与 A-003（10-20 完成）都有记录：20 日起他
+        # 同时计入安全组与进阶组，无需其他组也有效；协作组只有小林合格。
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 10, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-ADV", "activity_ids": ["A-003"], "valid_days": 3, "minimum_count": 1},
+        ]
+        result = self.app.group_coverage(groups, "2026-10-15", "2026-10-21", [])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+                {"group_id": "G-ADV", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1}],
+             "meets_requirements": False},
+            {"from_on": "2026-10-18", "to_on": "2026-10-19", "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+                {"group_id": "G-ADV", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1}],
+             "meets_requirements": False},
+            {"from_on": "2026-10-20", "to_on": "2026-10-21", "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+                {"group_id": "G-ADV", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0}],
+             "meets_requirements": False},
+        ])
+
+    def test_group_coverage_swap_splits_and_basis_change_merges(self):
+        self._group_coverage_ready()
+        # 小陈 10-16 又完成入门二：16 日小林、小陈同时合格，17 日起只剩小陈，
+        # 人数相同但人员更换仍分段。
+        self.app.enroll("A-002", "M-001")
+        self.app.record_completion("A-002", "M-001", "2026-10-16")
+        groups = [{"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 2, "minimum_count": 1}]
+        result = self.app.group_coverage(groups, "2026-10-15", "2026-10-18", [], ["M-002", "M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15", "groups": [
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0}],
+             "meets_requirements": True},
+            {"from_on": "2026-10-16", "to_on": "2026-10-16", "groups": [
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002", "M-001"], "valid_count": 2,
+                 "absent_member_ids": [], "available_member_ids": ["M-002", "M-001"], "available_count": 2, "shortage_count": 0}],
+             "meets_requirements": True},
+            {"from_on": "2026-10-17", "to_on": "2026-10-17", "groups": [
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0}],
+             "meets_requirements": True},
+            {"from_on": "2026-10-18", "to_on": "2026-10-18", "groups": [
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1}],
+             "meets_requirements": False},
+        ])
+        # 同一组合格依据从旧记录换成新记录（16 日起入门二的记录接管）但合格
+        # 人员不变：不分段。
+        groups = [{"group_id": "G-MIX", "activity_ids": ["A-001", "A-002"], "valid_days": 2, "minimum_count": 1}]
+        result = self.app.group_coverage(groups, "2026-10-15", "2026-10-18", [], ["M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-17", "groups": [
+                {"group_id": "G-MIX", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0}],
+             "meets_requirements": True},
+            {"from_on": "2026-10-18", "to_on": "2026-10-18", "groups": [
+                {"group_id": "G-MIX", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1}],
+             "meets_requirements": False},
+        ])
+
+    def test_group_coverage_absence_union_and_out_of_range(self):
+        self._group_coverage_ready()
+        groups = [{"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}]
+        # 重复、重叠、相邻的请假按日期并集处理，不重复扣人；范围外的日期及
+        # 未入选的已知成员不影响人数。
+        absences = [
+            {"member_id": " M-001 ", "from_on": "2026-10-16", "to_on": "2026-10-17"},
+            {"member_id": "M-001", "from_on": "2026-10-17", "to_on": "2026-10-18"},
+            {"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"},
+            {"member_id": "M-001", "from_on": "2026-11-01", "to_on": "2026-11-02"},
+            {"member_id": "M-002", "from_on": "2026-10-15", "to_on": "2026-10-17"},
+        ]
+        result = self.app.group_coverage(groups, "2026-10-15", "2026-10-20", absences, ["M-001"])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15", "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0}],
+             "meets_requirements": True},
+            {"from_on": "2026-10-16", "to_on": "2026-10-17", "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": ["M-001"], "available_member_ids": [], "available_count": 0, "shortage_count": 1}],
+             "meets_requirements": False},
+            # 18 日起小陈已不合格：请假名单只收录合格者中的请假者，与 19、20 日
+            # 合为一段。
+            {"from_on": "2026-10-18", "to_on": "2026-10-20", "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1}],
+             "meets_requirements": False},
+        ])
+
+    def test_group_coverage_member_selection_and_empty(self):
+        self._group_coverage_ready()
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 2},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        # 省略或 null 选择全员（按成员标识升序）；未合格成员的请假不出现在
+        # 请假名单中；各组需求可以超过选中人数。
+        absences = [{"member_id": "M-003", "from_on": "2026-10-15", "to_on": "2026-10-17"}]
+        expected = [{
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-17",
+            "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 2, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 1},
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+            ],
+            "meets_requirements": False,
+        }]
+        self.assertEqual(self.app.group_coverage(groups, "2026-10-15", "2026-10-17", absences)["periods"], expected)
+        self.assertEqual(self.app.group_coverage(groups, "2026-10-15", "2026-10-17", absences, None)["periods"], expected)
+        # 空数组表示无人：仍返回一个覆盖全范围的区间，各组人数为零且欠缺数
+        # 等于本组要求人数；未入选成员的请假仍须校验但不影响结果。
+        empty = self.app.group_coverage(groups, "2026-10-14", "2026-10-19", absences, [])
+        self.assertEqual(empty, {
+            "from_on": "2026-10-14",
+            "to_on": "2026-10-19",
+            "periods": [{
+                "from_on": "2026-10-14",
+                "to_on": "2026-10-19",
+                "groups": [
+                    {"group_id": "G-SAFE", "minimum_count": 2, "valid_member_ids": [], "valid_count": 0,
+                     "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 2},
+                    {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                     "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+                ],
+                "meets_requirements": False,
+            }],
+        })
+
+    def test_group_coverage_validity_past_date_max(self):
+        self._group_coverage_ready()
+        # 有效期越过 9999-12-31 不溢出：记录在整个查询范围内保持有效。
+        groups = [{"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3650000, "minimum_count": 1}]
+        result = self.app.group_coverage(groups, "9999-12-01", "9999-12-31", [])
+        self.assertEqual(result["periods"], [{
+            "from_on": "9999-12-01",
+            "to_on": "9999-12-31",
+            "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+            ],
+            "meets_requirements": True,
+        }])
+
+    def test_group_coverage_rejections(self):
+        self._group_coverage_ready()
+        valid_groups = [{"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}]
+        valid_absences = [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}]
+        # 缺少 absences 或显式 null、非数组均被拒绝；空数组合法。
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(valid_groups, "2026-10-14", "2026-10-19")
+        for absences in [None, "x", 1, {}]:
+            with self.assertRaises(ValueError, msg=absences):
+                self.app.group_coverage(valid_groups, "2026-10-14", "2026-10-19", absences)
+        # 组条目字段不符：缺少 minimum_count、缺少其他必填字段或含多余字段。
+        for groups in [[{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+                       [{"group_id": "G", "activity_ids": ["A-001"], "minimum_count": 1}],
+                       [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1, "extra": 1}]]:
+            with self.assertRaises(ValueError, msg=groups):
+                self.app.group_coverage(groups, "2026-10-14", "2026-10-19", valid_absences)
+        # 每组人数须为非布尔正整数。
+        for minimum_count in [True, 0, -1, "1", 1.5, None]:
+            groups = [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": minimum_count}]
+            with self.assertRaises(ValueError, msg=minimum_count):
+                self.app.group_coverage(groups, "2026-10-14", "2026-10-19", valid_absences)
+        # 顶层人数参数不被接受。
+        with self.assertRaises(TypeError):
+            self.app.group_coverage(valid_groups, "2026-10-14", "2026-10-19", valid_absences, minimum_count=1)
+        # 无人入选或请假在范围外时仍校验全部输入：未知活动、未知成员、逆序请假。
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3, "minimum_count": 1}],
+                "2026-10-14", "2026-10-19", valid_absences, [])
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(valid_groups, "2026-10-14", "2026-10-19",
+                                    [{"member_id": "GHOST", "from_on": "2026-11-01", "to_on": "2026-11-02"}], [])
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(valid_groups, "2026-10-14", "2026-10-19",
+                                    [{"member_id": "M-001", "from_on": "2026-11-02", "to_on": "2026-11-01"}], [])
+        # 沿用既有校验：空分组、活动跨组重复、逆序日期、成员选择去重。
+        with self.assertRaises(ValueError):
+            self.app.group_coverage([], "2026-10-14", "2026-10-19", valid_absences)
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(
+                [{"group_id": "G-ONE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+                 {"group_id": "G-TWO", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}],
+                "2026-10-14", "2026-10-19", valid_absences)
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(valid_groups, "2026-10-20", "2026-10-19", valid_absences)
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(valid_groups, "2026-10-14", "2026-10-19", valid_absences, ["M-001", " M-001 "])
+
+    def test_group_coverage_never_writes_and_legacy_data(self):
+        self._group_coverage_ready()
+        groups = [{"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}]
+        absences = [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}]
+        before = self.app.path.read_bytes()
+        self.app.group_coverage(groups, "2026-10-14", "2026-10-19", absences)
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(groups, "2026-10-14", "2026-10-19",
+                                    [{"member_id": "GHOST", "from_on": "2026-10-16", "to_on": "2026-10-16"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 旧数据缺少 completions：按无记录处理，查询不补写该字段。
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data.pop("completions", None)
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        result = self.app.group_coverage(groups, "2026-10-14", "2026-10-19", absences)
+        self.assertEqual(result["periods"], [{
+            "from_on": "2026-10-14",
+            "to_on": "2026-10-19",
+            "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1},
+            ],
+            "meets_requirements": False,
+        }])
+        self.assertNotIn("completions", json.loads(self.app.path.read_text(encoding="utf-8")))
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty-group-coverage"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.group_coverage(groups, "2026-10-14", "2026-10-19", absences)
+        self.assertFalse(empty.exists())
+
+    def test_group_coverage_broken_history_and_os_error(self):
+        self._group_coverage_ready()
+        groups = [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}]
+        absences = [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}]
+        broken = json.loads(self.app.path.read_text(encoding="utf-8"))
+        broken["members"]["M-002"]["name"] = "   "
+        self.app.path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.app.group_coverage(groups, "2026-10-14", "2026-10-19", absences)
+        self.app.path.unlink()
+        self.app.path.mkdir(parents=True)
+        with self.assertRaises(OSError):
+            self.app.group_coverage(groups, "2026-10-14", "2026-10-19", absences)
+
+    def test_cli_group_coverage_success_failure_and_partial_array(self):
+        self._group_coverage_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "group-coverage", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": " G-SAFE ", "activity_ids": [" A-001 "], "valid_days": 3, "minimum_count": 1},
+                             {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1}],
+                  "from_on": "2026-10-15", "to_on": "2026-10-15", "absences": []})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual(value["periods"], [{
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-15",
+            "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0},
+                {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-002"], "valid_count": 1,
+                 "absent_member_ids": [], "available_member_ids": ["M-002"], "available_count": 1, "shortage_count": 0},
+            ],
+            "meets_requirements": True,
+        }])
+        # 顶层人数参数不被接受；组条目缺少 minimum_count 同样被拒绝。
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}],
+                   "from_on": "2026-10-15", "to_on": "2026-10-15", "minimum_count": 1, "absences": []})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        partial = run([
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}],
+             "from_on": "2026-10-15", "to_on": "2026-10-15", "absences": [], "member_ids": []},
+            {"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}],
+             "from_on": "2026-10-15", "to_on": "2026-10-15", "absences": []},
+        ])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
     def _start_options_ready(self):
         # 与 _absence_ready 相同的基础数据，另让小林 2026-10-15 完成入门二：
         # 有效五天时小陈、小林在 2026-10-15 至 19 日均合格。
