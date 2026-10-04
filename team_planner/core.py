@@ -2468,6 +2468,283 @@ class TeamPlanner(JsonStore):
             ],
         }
 
+    def exclusive_group_coverage(self, groups, from_on, to_on, absences=None, member_ids=None):
+        # Read-only exclusive-assignment variant of group_coverage: the
+        # qualified and absent members per day and group are computed exactly
+        # as there, and every group's own fields keep their independent
+        # per-group meaning, but on top of that each period also judges one
+        # shared assignment for the day — a member fills at most one group's
+        # post that day and each group fills at most its own minimum_count
+        # posts, so the same person can no longer cover two groups at once.
+        # The assignment is only used for the headcount: nothing is ever
+        # stored, enrollments, completion records and profiles are used as
+        # they are, never reconstructed historically, and the current date is
+        # never consulted.
+        if not isinstance(groups, list) or not groups:
+            raise ValueError("groups must be a nonempty array")
+        selected_groups = []
+        seen_groups = set()
+        seen_activities = set()
+        for item in groups:
+            if not isinstance(item, dict) or set(item) != {"group_id", "activity_ids", "valid_days", "minimum_count"}:
+                raise ValueError("each group must contain only group_id, activity_ids, valid_days and minimum_count")
+            group_id = text(item["group_id"], "group_id")
+            if group_id in seen_groups:
+                raise ValueError("group_ids must not contain duplicates")
+            seen_groups.add(group_id)
+            valid_days = positive(item["valid_days"], "valid_days")
+            # The per-group headcount is a non-boolean positive integer; it may
+            # exceed the number of selected members.
+            minimum_count = positive(item["minimum_count"], "minimum_count")
+            activity_ids = item["activity_ids"]
+            if not isinstance(activity_ids, list) or not activity_ids:
+                raise ValueError("activity_ids must be a nonempty array")
+            group_activities = []
+            for activity_id in activity_ids:
+                activity_id = text(activity_id, "activity_id")
+                # As in group_coverage, an activity belongs to exactly one
+                # group and may not repeat inside it.
+                if activity_id in seen_activities:
+                    raise ValueError("activity_ids must not repeat within or across groups")
+                seen_activities.add(activity_id)
+                group_activities.append(activity_id)
+            selected_groups.append((group_id, group_activities, valid_days, minimum_count))
+        from_on = day(from_on, "from_on")
+        to_on = day(to_on, "to_on")
+        if from_on > to_on:
+            raise ValueError("from_on must be on or before to_on")
+        # The absence list is required, exactly as in group_coverage: null (or
+        # a missing argument) is rejected, an empty array is allowed.
+        if absences is None or not isinstance(absences, list):
+            raise ValueError("absences must be an array")
+        absence_entries = []
+        for item in absences:
+            if not isinstance(item, dict) or set(item) != {"member_id", "from_on", "to_on"}:
+                raise ValueError("each absence must contain only member_id, from_on and to_on")
+            absence_member_id = text(item["member_id"], "member_id")
+            absence_from = day(item["from_on"], "from_on")
+            absence_to = day(item["to_on"], "to_on")
+            # Whole-day closed intervals; a reversed range is rejected.
+            if absence_from > absence_to:
+                raise ValueError("from_on must be on or before to_on")
+            absence_entries.append((absence_member_id, absence_from, absence_to))
+        # member_ids follows group_coverage exactly: omitted or null means
+        # every member, an empty array means no members at all.
+        if member_ids is None:
+            selected_member_ids = None
+        elif not isinstance(member_ids, list):
+            raise ValueError("member_ids must be an array or null")
+        else:
+            selected_member_ids = []
+            seen_members = set()
+            for member_id in member_ids:
+                member_id = text(member_id, "member_id")
+                if member_id in seen_members:
+                    raise ValueError("member_ids must not contain duplicates")
+                seen_members.add(member_id)
+                selected_member_ids.append(member_id)
+        data = self._read()
+        members = data.get("members", {})
+        activities = data.get("activities", {})
+        completions = data.get("completions", {})
+        # Every reference is validated even when nobody is selected and every
+        # absence falls outside the range.
+        for _, activity_ids, _, _ in selected_groups:
+            for activity_id in activity_ids:
+                if activities.get(activity_id) is None:
+                    raise ValueError("unknown activity")
+        if selected_member_ids is None:
+            # Everyone, by ascending identifier.
+            ordered_member_ids = sorted(members)
+        else:
+            for member_id in selected_member_ids:
+                if member_id not in members:
+                    raise ValueError("unknown member")
+            ordered_member_ids = selected_member_ids
+        for absence_member_id, _, _ in absence_entries:
+            if absence_member_id not in members:
+                raise ValueError("unknown member")
+        start = date.fromisoformat(from_on)
+        end = date.fromisoformat(to_on)
+
+        def valid_intervals(member_id, activity_ids, valid_days):
+            # The eligible records are exactly group_coverage's, which are
+            # exactly training_validity's: a stored completion only exists for
+            # enrolled members, and a missing record is the same as no record.
+            records_by_date = {}
+            for activity_id in activity_ids:
+                activity = activities[activity_id]
+                if member_id not in activity.get("participants", []):
+                    continue
+                completed_on = completions.get(activity_id, {}).get(member_id)
+                if completed_on is not None:
+                    records_by_date.setdefault(date.fromisoformat(completed_on), []).append(
+                        (activity["on"], activity_id)
+                    )
+            takeovers = sorted(records_by_date)
+            intervals = []
+            for index, completed in enumerate(takeovers):
+                segment_end = takeovers[index + 1] - timedelta(days=1) if index + 1 < len(takeovers) else date.max
+                # The expiry is the completion day plus valid_days calendar
+                # days; the expiry day itself is expired. An expiry past
+                # date.max is beyond every possible range end, so the record
+                # stays valid through the range instead of raising.
+                try:
+                    expires = completed + timedelta(days=valid_days)
+                except OverflowError:
+                    expires = None
+                valid_end = segment_end if expires is None else min(segment_end, expires - timedelta(days=1))
+                frm, to = max(completed, start), min(valid_end, end)
+                if frm <= to:
+                    intervals.append((frm, to))
+            return intervals
+
+        # Per member and group, the days on which that group alone is valid;
+        # the groups are never intersected with each other.
+        qualified = [
+            [valid_intervals(member_id, activity_ids, valid_days) for _, activity_ids, valid_days, _ in selected_groups]
+            for member_id in ordered_member_ids
+        ]
+
+        # Per selected member, the absence days inside the range, exactly as in
+        # group_coverage: repeated, overlapping or adjacent requests are a
+        # union of days and never deduct the member twice; absences of members
+        # not selected and days outside the range never change the counts.
+        absent = {member_id: [] for member_id in ordered_member_ids}
+        for absence_member_id, absence_from, absence_to in absence_entries:
+            if absence_member_id not in absent:
+                continue
+            frm = max(date.fromisoformat(absence_from), start)
+            to = min(date.fromisoformat(absence_to), end)
+            if frm <= to:
+                absent[absence_member_id].append((frm, to))
+
+        # Sweep the range exactly as in group_coverage: any group's qualified
+        # set or the absent set can only change where one of the intervals
+        # starts or ends, so the days between consecutive edges share every
+        # set — and therefore share one maximum assignment too. Every edge
+        # lies inside the range, so no date overflows.
+        edges = set()
+        for per_group in qualified:
+            for intervals in per_group:
+                for frm, to in intervals:
+                    if frm > start:
+                        edges.add(frm)
+                    if to < end:
+                        edges.add(to + timedelta(days=1))
+        for intervals in absent.values():
+            for frm, to in intervals:
+                if frm > start:
+                    edges.add(frm)
+                if to < end:
+                    edges.add(to + timedelta(days=1))
+        boundaries = [start] + sorted(edges)
+        periods = []
+        for index, frm in enumerate(boundaries):
+            to = boundaries[index + 1] - timedelta(days=1) if index + 1 < len(boundaries) else end
+            key = tuple(
+                (
+                    tuple(
+                        member_id
+                        for member_id, member_qualified in zip(ordered_member_ids, qualified)
+                        if any(f <= frm <= t for f, t in member_qualified[group_index])
+                    ),
+                    tuple(
+                        member_id
+                        for member_id, member_qualified in zip(ordered_member_ids, qualified)
+                        if any(f <= frm <= t for f, t in member_qualified[group_index])
+                        and any(f <= frm <= t for f, t in absent[member_id])
+                    ),
+                )
+                for group_index in range(len(selected_groups))
+            )
+            if periods and periods[-1][2] == key:
+                # Same qualified and absent members in every group on the
+                # following days extend the open period instead of starting a
+                # new one; a same-size swap of people still splits, and a mere
+                # change of the underlying completion record never does.
+                periods[-1][1] = to
+            else:
+                periods.append([frm, to, key])
+
+        def max_filled(key):
+            # The most posts fillable at once: a bipartite b-matching between
+            # available members (one post each per day) and group posts (each
+            # group at most its own minimum_count). An augmenting-path search
+            # over members finds the maximum even when a greedy per-group
+            # order would strand a shared member in the wrong group. Group
+            # capacities are capped at the member count, so a huge
+            # minimum_count never expands the search.
+            adjacency = {}
+            for group_index, (ids, away) in enumerate(key):
+                for member_id in ids:
+                    if member_id not in away:
+                        adjacency.setdefault(member_id, []).append(group_index)
+            capacities = [
+                min(minimum_count, len(ordered_member_ids))
+                for _, _, _, minimum_count in selected_groups
+            ]
+            matched = [set() for _ in selected_groups]
+
+            def augment(member_id, visited):
+                for group_index in adjacency.get(member_id, ()):
+                    if group_index in visited:
+                        continue
+                    visited.add(group_index)
+                    if len(matched[group_index]) < capacities[group_index]:
+                        matched[group_index].add(member_id)
+                        return True
+                    # The group is full: try to move one of its current
+                    # members to another group and take the freed post.
+                    for displaced in list(matched[group_index]):
+                        matched[group_index].discard(displaced)
+                        if augment(displaced, visited):
+                            matched[group_index].add(member_id)
+                            return True
+                        matched[group_index].add(displaced)
+                return False
+
+            for member_id in ordered_member_ids:
+                augment(member_id, set())
+            return sum(len(posts) for posts in matched)
+
+        required_count = sum(minimum_count for _, _, _, minimum_count in selected_groups)
+        period_rows = []
+        for frm, to, key in periods:
+            filled_count = max_filled(key)
+            shortage_count = required_count - filled_count
+            period_rows.append({
+                "from_on": frm.isoformat(),
+                "to_on": to.isoformat(),
+                "groups": [
+                    {
+                        "group_id": group_id,
+                        "minimum_count": minimum_count,
+                        "valid_member_ids": list(ids),
+                        "valid_count": len(ids),
+                        "absent_member_ids": list(away),
+                        "available_member_ids": [member_id for member_id in ids if member_id not in away],
+                        "available_count": len(ids) - len(away),
+                        "shortage_count": max(0, minimum_count - (len(ids) - len(away))),
+                    }
+                    for (group_id, _, _, minimum_count), (ids, away) in zip(selected_groups, key)
+                ],
+                # The shared assignment for the day: the total demand, the
+                # most posts one exclusive assignment can fill, and their
+                # difference. Only a period with no overall shortage meets
+                # the requirements, even when every group looks covered on
+                # its own.
+                "required_count": required_count,
+                "filled_count": filled_count,
+                "shortage_count": shortage_count,
+                "meets_requirements": shortage_count == 0,
+            })
+        return {
+            "from_on": from_on,
+            "to_on": to_on,
+            "periods": period_rows,
+        }
+
     def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None, avoid_pending_training=False):
         # Read-only start-date recommendation over preview_absence_coverage:
         # the qualified and absent members per day are computed exactly as
