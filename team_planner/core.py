@@ -2238,12 +2238,14 @@ class TeamPlanner(JsonStore):
             ],
         }
 
-    def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None):
+    def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None, avoid_pending_training=False):
         # Read-only start-date recommendation over preview_absence_coverage:
         # the qualified and absent members per day are computed exactly as
         # there, and on top of that one ephemeral leave of `days` consecutive
         # calendar days for one selected member is tried at every possible
-        # start date. The leave exists only for this call: nothing is ever
+        # start date. With avoid_pending_training the candidate leave must
+        # additionally avoid every day on which the leave taker has their own
+        # pending training. The leave exists only for this call: nothing is ever
         # stored, and enrollments, completion records and profiles are used as
         # they are, never reconstructed historically; the current date is
         # never consulted.
@@ -2298,6 +2300,10 @@ class TeamPlanner(JsonStore):
         member_id = text(member_id, "member_id")
         # The leave length is a non-boolean positive integer of calendar days.
         days = positive(days, "days")
+        # The pending-training filter is a strict boolean: omitted or false
+        # keeps the plain headcount recommendation.
+        if type(avoid_pending_training) is not bool:
+            raise ValueError("avoid_pending_training must be a boolean")
         # member_ids follows preview_absence_coverage exactly: omitted or null
         # means every member, an empty array means no members at all.
         if member_ids is None:
@@ -2454,6 +2460,40 @@ class TeamPlanner(JsonStore):
                     bad[-1][1] = to
                 else:
                     bad.append([frm, to])
+        if avoid_pending_training:
+            # The leave taker's own pending trainings: every activity they are
+            # currently enrolled in (not only the selected groups) without
+            # their own completion record, exactly member_schedule's pending.
+            # A record dated after the query range still counts as completed;
+            # other members' enrollments and records, activities the member
+            # never joined and days outside the range never matter. A pending
+            # training day blocks every candidate leave covering it, even on
+            # days the member is unqualified or already absent, so those days
+            # simply join the bad runs; several activities on one day still
+            # block that day only once.
+            pending_days = set()
+            for activity_id, activity in activities.items():
+                if member_id not in activity.get("participants", []):
+                    continue
+                if member_id in completions.get(activity_id, {}):
+                    continue
+                on = date.fromisoformat(activity["on"])
+                if start <= on <= end:
+                    pending_days.add(on)
+            for on in sorted(pending_days):
+                bad.append([on, on])
+            bad.sort(key=lambda run: run[0])
+            merged = []
+            for frm, to in bad:
+                last = merged[-1][1] if merged else None
+                if last is not None and (frm <= last or (last < date.max and frm <= last + timedelta(days=1))):
+                    # Overlapping or adjacent runs merge into one maximal run;
+                    # a run ending at date.max already absorbs every later day.
+                    if to > last:
+                        merged[-1][1] = to
+                else:
+                    merged.append([frm, to])
+            bad = merged
         windows = []
         # A leave longer than the query range can never fit; the start windows
         # are simply empty then. Otherwise the latest start still ends inside

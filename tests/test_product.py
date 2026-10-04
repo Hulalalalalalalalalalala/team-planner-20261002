@@ -4088,6 +4088,167 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(partial.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _avoid_pending_ready(self):
+        # 与 _start_options_ready 相同的基础数据，另让小陈报名 2026-10-17 的
+        # 待完成培训：开启避开待完成培训筛选时起日不可覆盖 17 日。
+        self._start_options_ready()
+        self.app.create_activity("A-100", "待完成培训", "2026-10-17", 3)
+        self.app.enroll("A-100", "M-001")
+
+    def test_absence_start_options_avoid_pending_training_example(self):
+        self._avoid_pending_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # 没有已有请假、期望一人，小陈申请两天且 17 日有待完成培训：省略或
+        # 关闭筛选时仍返回 15 至 18 日，开启后只返回 15 日与 18 日两个单日区间。
+        expected_off = [{"from_on": "2026-10-15", "to_on": "2026-10-18"}]
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2)
+        self.assertEqual(result["start_windows"], expected_off)
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2, None, False)
+        self.assertEqual(result["start_windows"], expected_off)
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2,
+                                                avoid_pending_training=True)
+        self.assertEqual(result, {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-19",
+            "minimum_count": 1,
+            "member_id": "M-001",
+            "days": 2,
+            "start_windows": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-15"},
+                {"from_on": "2026-10-18", "to_on": "2026-10-18"},
+            ],
+        })
+
+    def test_absence_start_options_avoid_pending_training_scope(self):
+        self._avoid_pending_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # 本人已有完成记录时不阻挡，完成日期晚于查询范围也照此处理。
+        self.app.create_activity("A-101", "已完成培训", "2026-10-18", 3)
+        self.app.enroll("A-101", "M-001")
+        self.app.record_completion("A-101", "M-001", "2026-10-25")
+        # 其他成员报名的待完成培训、本人未报名的活动与区间外活动都不阻挡。
+        self.app.create_activity("A-102", "他人待完成", "2026-10-16", 3)
+        self.app.enroll("A-102", "M-002")
+        self.app.create_activity("A-103", "未报名", "2026-10-16", 3)
+        self.app.create_activity("A-104", "区间外待完成", "2026-10-21", 3)
+        self.app.enroll("A-104", "M-001")
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 1,
+                                                avoid_pending_training=True)
+        self.assertEqual(result["start_windows"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-16"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-19"},
+        ])
+        # 同日多场待完成培训不重复排除：17 日再加一场，可行起日不变。
+        self.app.create_activity("A-105", "同日待完成", "2026-10-17", 3)
+        self.app.enroll("A-105", "M-001")
+        same = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 1,
+                                              avoid_pending_training=True)
+        self.assertEqual(same["start_windows"], result["start_windows"])
+
+    def test_absence_start_options_avoid_pending_training_blocks_off_days(self):
+        self._start_options_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # 小周从未合格，请假本不扣人；但其 17 日待完成培训开启筛选后仍阻挡。
+        self.app.create_activity("A-100", "待完成培训", "2026-10-17", 3)
+        self.app.enroll("A-100", "M-003")
+        expected = [
+            {"from_on": "2026-10-15", "to_on": "2026-10-16"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-19"},
+        ]
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-003", 1,
+                                                avoid_pending_training=True)
+        self.assertEqual(result["start_windows"], expected)
+        # 本人当天已在 absences 中请假时，待完成培训仍阻挡。
+        result = self.app.absence_start_options(
+            groups, "2026-10-15", "2026-10-19", 1,
+            [{"member_id": "M-003", "from_on": "2026-10-17", "to_on": "2026-10-17"}],
+            "M-003", 1, avoid_pending_training=True)
+        self.assertEqual(result["start_windows"], expected)
+
+    def test_absence_start_options_avoid_pending_training_empty_and_boundaries(self):
+        self._avoid_pending_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        # 待完成培训覆盖整段查询范围时无可起日；days 超过范围时数组也为空。
+        result = self.app.absence_start_options(groups, "2026-10-17", "2026-10-17", 1, [], "M-001", 1,
+                                                avoid_pending_training=True)
+        self.assertEqual(result["start_windows"], [])
+        result = self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 6,
+                                                None, True)
+        self.assertEqual(result["start_windows"], [])
+        # 9999-12-31 的待完成培训只阻挡覆盖它的起日，日期计算不溢出。
+        self.app.create_activity("A-200", "年末待完成", "9999-12-31", 3)
+        self.app.enroll("A-200", "M-001")
+        far = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 10**9}]
+        result = self.app.absence_start_options(far, "9999-12-25", "9999-12-31", 1, [], "M-001", 2,
+                                                avoid_pending_training=True)
+        self.assertEqual(result["start_windows"], [{"from_on": "9999-12-25", "to_on": "9999-12-29"}])
+        # 0001-01-01 边界同样不溢出：首日的待完成培训只让次日起可起假。
+        fresh = TeamPlanner(self.root / "min-date")
+        fresh.add_member("M-001", "小陈")
+        fresh.add_member("M-002", "小林")
+        fresh.create_activity("A-001", "入门一", "0001-01-01", 2)
+        fresh.enroll("A-001", "M-001")
+        fresh.enroll("A-001", "M-002")
+        fresh.record_completion("A-001", "M-001", "0001-01-01")
+        fresh.record_completion("A-001", "M-002", "0001-01-01")
+        fresh.create_activity("A-100", "待完成培训", "0001-01-01", 2)
+        fresh.enroll("A-100", "M-001")
+        near = [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 10**9}]
+        result = fresh.absence_start_options(near, "0001-01-01", "0001-01-03", 1, [], "M-001", 1,
+                                             avoid_pending_training=True)
+        self.assertEqual(result["start_windows"], [{"from_on": "0001-01-02", "to_on": "0001-01-03"}])
+
+    def test_absence_start_options_avoid_pending_training_rejections(self):
+        self._avoid_pending_ready()
+        groups = [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}]
+        before = self.app.path.read_bytes()
+        # null、数字、字符串等非布尔值均被拒绝；无可起日（days 超过范围）时
+        # 仍校验该参数，其余输入与历史校验不变。
+        for flag in [None, 0, 1, 2.0, "true", "", [], {}]:
+            with self.assertRaises(ValueError, msg=flag):
+                self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2, None, flag)
+            with self.assertRaises(ValueError, msg=flag):
+                self.app.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 100, None, flag)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 开启筛选的失败查询不创建目录或文件。
+        empty = self.root / "empty-avoid-pending"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.absence_start_options(groups, "2026-10-15", "2026-10-19", 1, [], "M-001", 2,
+                                        avoid_pending_training=True)
+        self.assertFalse(empty.exists())
+
+    def test_cli_absence_start_options_avoid_pending_training(self):
+        self._avoid_pending_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "absence-start-options", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        base = {"groups": [{"group_id": "G-ENTRY", "activity_ids": ["A-001", "A-002"], "valid_days": 5}],
+                "from_on": "2026-10-15", "to_on": "2026-10-19", "minimum_count": 1,
+                "absences": [], "member_id": "M-001", "days": 2}
+        ok = run({**base, "avoid_pending_training": True})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["start_windows"], [
+            {"from_on": "2026-10-15", "to_on": "2026-10-15"},
+            {"from_on": "2026-10-18", "to_on": "2026-10-18"},
+        ])
+        off = run(base)
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertEqual(json.loads(off.stdout)["start_windows"], [{"from_on": "2026-10-15", "to_on": "2026-10-18"}])
+        for flag in [None, 1, "true"]:
+            bad = run({**base, "avoid_pending_training": flag})
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("error", json.loads(bad.stderr))
+            self.assertEqual(bad.stdout, "")
+        partial = run([{**base, "avoid_pending_training": True}, {**base, "avoid_pending_training": 0}])
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("error", json.loads(partial.stderr))
+        self.assertEqual(partial.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
     def _renewal_ready(self):
         # 小陈 2026-10-15 在组内 A-001 完成、有效三天（10-18 到期）；组内另有
         # 10-17（窗口前）、10-19 满员且与本人两场同日活动冲突的 A-002、10-20 尚
