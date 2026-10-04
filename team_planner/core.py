@@ -2515,6 +2515,102 @@ class TeamPlanner(JsonStore):
             period["meets_requirements"] = filled == required
         return result
 
+    def preview_group_assignments(self, groups, from_on, to_on, absences=None, member_ids=None):
+        # Read-only concrete staffing suggestion over exclusive_group_coverage:
+        # the inputs, validation, period splitting and merging, and every
+        # outer, period and per-group figure are exactly
+        # exclusive_group_coverage's; on top of that each period also names
+        # one maximum assignment of members to group positions. The
+        # suggestion exists only for this call: nothing is ever stored, and
+        # the current date is never consulted.
+        result = self.exclusive_group_coverage(groups, from_on, to_on, absences, member_ids)
+        data = self._read()
+        if member_ids is None:
+            # Everyone, by ascending identifier, exactly as in group_coverage.
+            ordered_member_ids = sorted(data.get("members", {}))
+        else:
+            ordered_member_ids = [text(member_id, "member_id") for member_id in member_ids]
+        position = {member_id: index for index, member_id in enumerate(ordered_member_ids)}
+        total = len(ordered_member_ids)
+        for period in result["periods"]:
+            per_group = period["groups"]
+            capacities = [group["minimum_count"] for group in per_group]
+            # Candidate positions per group, ascending: only members whose
+            # training is valid for the group that day and who are not absent.
+            candidates = [sorted(position[member_id] for member_id in group["available_member_ids"]) for group in per_group]
+            target = period["filled_count"]
+            # Among all assignments filling the most positions, the suggested
+            # one is lexicographically smallest by the position sequence: each
+            # group's assigned positions ascending, padded with empty slots
+            # (sorting after every member) up to its minimum_count, groups
+            # concatenated in input order. The slots are decided greedily in
+            # exactly that order; a decided prefix is kept as forced
+            # assignments and passed-over candidates as forbidden pairs.
+            forced = {}
+            forbidden = [set() for _ in per_group]
+            chosen = [[] for _ in per_group]
+
+            def fillable():
+                # A completion to a maximum assignment still exists: the
+                # largest matching consistent with the decided slots reaches
+                # the period's filled_count.
+                matched = {}
+
+                def augment(group_index, seen):
+                    for pos in candidates[group_index]:
+                        if pos in forced or pos in forbidden[group_index] or pos in seen:
+                            continue
+                        seen.add(pos)
+                        if pos not in matched or augment(matched[pos], seen):
+                            matched[pos] = group_index
+                            return True
+                    return False
+
+                size = len(forced)
+                for group_index in range(len(per_group)):
+                    for _ in range(capacities[group_index] - len(chosen[group_index])):
+                        if not augment(group_index, set()):
+                            break
+                        size += 1
+                return size == target
+
+            for group_index in range(len(per_group)):
+                while len(chosen[group_index]) < capacities[group_index]:
+                    last = chosen[group_index][-1] if chosen[group_index] else -1
+                    padded = False
+                    for pos in range(last + 1, total + 1):
+                        if pos == total:
+                            # An empty slot sorts after every member: the group
+                            # takes nobody else, so every remaining candidate
+                            # is forbidden for it.
+                            added = [p for p in candidates[group_index] if p > last and p not in forced and p not in forbidden[group_index]]
+                            forbidden[group_index].update(added)
+                            if fillable():
+                                padded = True
+                                break
+                            forbidden[group_index].difference_update(added)
+                        else:
+                            if pos in forced or pos not in candidates[group_index]:
+                                continue
+                            forced[pos] = group_index
+                            chosen[group_index].append(pos)
+                            if fillable():
+                                break
+                            del forced[pos]
+                            chosen[group_index].pop()
+                            # A passed-over candidate can never join this
+                            # group: it would sit in front of the slot finally
+                            # chosen.
+                            forbidden[group_index].add(pos)
+                    if padded:
+                        break
+            for group, group_chosen in zip(per_group, chosen):
+                assigned = [ordered_member_ids[pos] for pos in group_chosen]
+                group["assigned_member_ids"] = assigned
+                group["assigned_count"] = len(assigned)
+                group["unfilled_count"] = group["minimum_count"] - len(assigned)
+        return result
+
     def absence_start_options(self, groups, from_on, to_on, minimum_count, absences=None, member_id=None, days=None, member_ids=None, avoid_pending_training=False):
         # Read-only start-date recommendation over preview_absence_coverage:
         # the qualified and absent members per day are computed exactly as

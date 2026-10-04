@@ -4421,6 +4421,188 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(bad.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def test_preview_group_assignments_example(self):
+        self._exclusive_group_coverage_ready()
+        # 2026-10-15 安全、协作两组各需一人：小陈两组均有效，小林仅安全有效，
+        # 建议小林承担安全、小陈承担协作；总人数不因先排前组而减少。
+        self.app.enroll("A-001", "M-002")
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        result = self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", [])
+        self.assertEqual(result, {
+            "from_on": "2026-10-15",
+            "to_on": "2026-10-15",
+            "periods": [
+                {"from_on": "2026-10-15", "to_on": "2026-10-15",
+                 "required_count": 2, "filled_count": 2, "shortage_count": 0, "meets_requirements": True, "groups": [
+                    {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": ["M-001", "M-002"], "valid_count": 2,
+                     "absent_member_ids": [], "available_member_ids": ["M-001", "M-002"], "available_count": 2, "shortage_count": 0,
+                     "assigned_member_ids": ["M-002"], "assigned_count": 1, "unfilled_count": 0},
+                    {"group_id": "G-COOP", "minimum_count": 1, "valid_member_ids": ["M-001"], "valid_count": 1,
+                     "absent_member_ids": [], "available_member_ids": ["M-001"], "available_count": 1, "shortage_count": 0,
+                     "assigned_member_ids": ["M-001"], "assigned_count": 1, "unfilled_count": 0},
+                ]},
+            ],
+        })
+
+    def test_preview_group_assignments_tie_break(self):
+        self._exclusive_group_coverage_ready()
+        # 小林两组都完成后，两人两组均可出勤：最大方案有两种，按成员选择顺序
+        # 的位置序列取字典序最小者——前组先拿位置靠前的小陈。
+        self.app.enroll("A-001", "M-002")
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        self.app.record_completion("A-002", "M-002", "2026-10-15")
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        result = self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", [])
+        period = result["periods"][0]
+        self.assertEqual([group["assigned_member_ids"] for group in period["groups"]], [["M-001"], ["M-002"]])
+        self.assertEqual([group["assigned_count"] for group in period["groups"]], [1, 1])
+        self.assertEqual([group["unfilled_count"] for group in period["groups"]], [0, 0])
+        # 显式成员选择改变位置序列：小林排在前时由小林承担前组。
+        swapped = self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", [], ["M-002", "M-001"])
+        self.assertEqual([group["assigned_member_ids"] for group in swapped["periods"][0]["groups"]], [["M-002"], ["M-001"]])
+
+    def test_preview_group_assignments_unfilled(self):
+        self._exclusive_group_coverage_ready()
+        # 仅小陈两组均可出勤：整体只能填一岗，字典序最小方案把前组填满、
+        # 后组留空；各组分配人数之和等于 filled_count，未填之和等于 shortage_count。
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        result = self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", [])
+        period = result["periods"][0]
+        self.assertEqual((period["required_count"], period["filled_count"], period["shortage_count"]), (2, 1, 1))
+        self.assertFalse(period["meets_requirements"])
+        self.assertEqual([group["assigned_member_ids"] for group in period["groups"]], [["M-001"], []])
+        self.assertEqual([group["assigned_count"] for group in period["groups"]], [1, 0])
+        self.assertEqual([group["unfilled_count"] for group in period["groups"]], [0, 1])
+        self.assertEqual(sum(group["assigned_count"] for group in period["groups"]), period["filled_count"])
+        self.assertEqual(sum(group["unfilled_count"] for group in period["groups"]), period["shortage_count"])
+
+    def test_preview_group_assignments_absence_splits_periods(self):
+        self._exclusive_group_coverage_ready()
+        self.app.enroll("A-001", "M-002")
+        self.app.record_completion("A-001", "M-002", "2026-10-15")
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        # 区间划分及合并完全沿用原核对结果，各日期独立分配：15 日两岗填满，
+        # 16 日小陈请假后协作组无人可出勤、人选为空。
+        result = self.app.preview_group_assignments(
+            groups, "2026-10-15", "2026-10-16",
+            [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}], ["M-001", "M-002"])
+        self.assertEqual([(period["from_on"], period["to_on"]) for period in result["periods"]],
+                         [("2026-10-15", "2026-10-15"), ("2026-10-16", "2026-10-16")])
+        first, second = result["periods"]
+        self.assertEqual([group["assigned_member_ids"] for group in first["groups"]], [["M-002"], ["M-001"]])
+        self.assertEqual([group["assigned_member_ids"] for group in second["groups"]], [["M-002"], []])
+        self.assertEqual([group["unfilled_count"] for group in second["groups"]], [0, 1])
+        self.assertEqual((second["filled_count"], second["shortage_count"]), (1, 1))
+
+    def test_preview_group_assignments_empty_selection(self):
+        self._exclusive_group_coverage_ready()
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 2},
+        ]
+        # 无人入选：各组人选为空、未填人数等于需求，仍返回覆盖查询范围的区间。
+        result = self.app.preview_group_assignments(groups, "2026-10-14", "2026-10-19", [], [])
+        self.assertEqual(result["periods"], [
+            {"from_on": "2026-10-14", "to_on": "2026-10-19",
+             "required_count": 3, "filled_count": 0, "shortage_count": 3, "meets_requirements": False, "groups": [
+                {"group_id": "G-SAFE", "minimum_count": 1, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 1,
+                 "assigned_member_ids": [], "assigned_count": 0, "unfilled_count": 1},
+                {"group_id": "G-COOP", "minimum_count": 2, "valid_member_ids": [], "valid_count": 0,
+                 "absent_member_ids": [], "available_member_ids": [], "available_count": 0, "shortage_count": 2,
+                 "assigned_member_ids": [], "assigned_count": 0, "unfilled_count": 2},
+            ]},
+        ])
+        # 无人可分配也校验全部输入和历史。
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(
+                [{"group_id": "G", "activity_ids": ["GHOST"], "valid_days": 3, "minimum_count": 1}],
+                "2026-10-14", "2026-10-19", [], [])
+
+    def test_preview_group_assignments_rejections(self):
+        self._exclusive_group_coverage_ready()
+        groups = [
+            {"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+            {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1},
+        ]
+        # 校验与 exclusive-group-coverage 完全一致：缺少 absences 或显式 null、
+        # 逆序日期、未知或重复引用、条目字段缺失或多余均抛出 ValueError。
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15")
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", None)
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(groups, "2026-10-16", "2026-10-15", [])
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15",
+                                               [{"member_id": "GHOST", "from_on": "2026-10-15", "to_on": "2026-10-15"}])
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments([dict(groups[0]), dict(groups[0])], "2026-10-15", "2026-10-15", [])
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(
+                [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3}], "2026-10-15", "2026-10-15", [])
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", [], ["GHOST"])
+        # 顶层人数参数不被接受。
+        with self.assertRaises(TypeError):
+            self.app.preview_group_assignments(groups, "2026-10-15", "2026-10-15", [], None, 1)
+
+    def test_preview_group_assignments_never_writes(self):
+        self._exclusive_group_coverage_ready()
+        groups = [{"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}]
+        before = self.app.path.read_bytes()
+        self.app.preview_group_assignments(groups, "2026-10-14", "2026-10-19", [])
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.preview_group_assignments(groups, "2026-10-14", "2026-10-19",
+                                               [{"member_id": "GHOST", "from_on": "2026-10-16", "to_on": "2026-10-16"}])
+        self.assertEqual(before, self.app.path.read_bytes())
+        # 空目录上的失败查询不创建目录或文件。
+        empty = self.root / "empty-preview-group-assignments"
+        fresh = TeamPlanner(empty)
+        with self.assertRaises(ValueError):
+            fresh.preview_group_assignments(groups, "2026-10-14", "2026-10-19",
+                                            [{"member_id": "M-001", "from_on": "2026-10-16", "to_on": "2026-10-16"}])
+        self.assertFalse(empty.exists())
+
+    def test_cli_preview_group_assignments(self):
+        self._exclusive_group_coverage_ready()
+        def run(payload):
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as stream:
+                json.dump(payload, stream)
+                name = stream.name
+            return subprocess.run([sys.executable, "-m", "team_planner", "--root", str(self.root), "preview-group-assignments", name], text=True, capture_output=True)
+        before = self.app.path.read_bytes()
+        ok = run({"groups": [{"group_id": "G-SAFE", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1},
+                             {"group_id": "G-COOP", "activity_ids": ["A-002"], "valid_days": 3, "minimum_count": 1}],
+                  "from_on": "2026-10-15", "to_on": "2026-10-15", "absences": [], "member_ids": ["M-001"]})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertNotIn("minimum_count", value)
+        self.assertEqual(value["periods"][0]["filled_count"], 1)
+        self.assertEqual([group["assigned_member_ids"] for group in value["periods"][0]["groups"]], [["M-001"], []])
+        self.assertEqual([group["unfilled_count"] for group in value["periods"][0]["groups"]], [0, 1])
+        # 顶层人数参数不被接受；失败仅标准错误含 error，标准输出为空。
+        bad = run({"groups": [{"group_id": "G", "activity_ids": ["A-001"], "valid_days": 3, "minimum_count": 1}],
+                   "from_on": "2026-10-15", "to_on": "2026-10-15", "minimum_count": 1, "absences": []})
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stderr))
+        self.assertEqual(bad.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
     def _start_options_ready(self):
         # 与 _absence_ready 相同的基础数据，另让小林 2026-10-15 完成入门二：
         # 有效五天时小陈、小林在 2026-10-15 至 19 日均合格。
